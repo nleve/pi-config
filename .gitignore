@@ -1,0 +1,15 @@
+# Secrets — never commit.
+auth.json
+
+# Session transcripts and runtime state.
+sessions/
+pi-irc-seen/
+snapcompact/blobs/
+snapcompact/.last-gc
+
+# Downloaded binaries (re-fetched on demand).
+bin/
+
+# OS / editor noise.
+.DS_Store
+*.log

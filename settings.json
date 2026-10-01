@@ -1,0 +1,9 @@
+{
+  "lastChangelogVersion": "1.0.0",
+  "defaultProvider": "opencode-go",
+  "defaultModel": "deepseek-v4.1-flash",
+  "tuiMode": "fullscreen",
+  "defaultTools": [
+    "+codemode"
+  ]
+}

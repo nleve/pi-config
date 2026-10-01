@@ -1,0 +1,8 @@
+{
+  "default": "snapcompact",
+  "picker": true,
+  "maxFrames": 40,
+  "shape": "auto",
+  "toolResults": false,
+  "blobStore": true
+}

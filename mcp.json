@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "agent-browser": {
+      "command": "agent-browser",
+      "args": ["mcp", "--tools", "all"],
+      "description": "Automate a real Chromium browser via agent-browser: navigate, accessibility snapshots with @refs, click/fill/type, eval JS, screenshots, tabs, network, cookies/auth, a11y. Prefer over fetch for client-rendered or authenticated pages.",
+      "exposure": "codemode",
+      "timeout": 120,
+      "toolExposure": {
+        "agent_browser_install": "hidden",
+        "agent_browser_upgrade": "hidden",
+        "agent_browser_chat": "hidden"
+      }
+    }
+  }
+}
