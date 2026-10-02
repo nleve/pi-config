@@ -516,7 +516,8 @@ async function listWorkspacePanes(
 	).catch(() => undefined);
 	if (!panes) return undefined;
 	const rec = asRecord(panes.result);
-	return Array.isArray(rec?.panes) ? (rec.panes as Record<string, unknown>[]) : [];
+	if (!Array.isArray(rec?.panes)) return undefined;
+	return rec.panes as Record<string, unknown>[];
 }
 
 /** Same-label workspace ids, ascending (undefined when the list failed). */
