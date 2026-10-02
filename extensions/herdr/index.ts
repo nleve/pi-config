@@ -989,14 +989,17 @@ async function stampParent(
 	expected?: { session_path?: string; startedAt?: number },
 ): Promise<void> {
 	if (!paneId) return;
+	// A worker that is slow to answer its first turn can take longer than a
+	// couple of seconds to register, so poll up to herdr's come-up budget.
+	const deadline = Date.now() + 30000;
 	try {
-		for (let attempt = 0; attempt < 8; attempt++) {
+		while (Date.now() < deadline) {
 			const found = identityForPane(paneId);
 			if (found && matchesExpectedWorker(found, expected)) {
 				setIdentityParent(paneId, parent);
 				return;
 			}
-			await new Promise((r) => setTimeout(r, 250));
+			await new Promise((r) => setTimeout(r, 500));
 		}
 	} catch {
 		/* best-effort: the parent link is a convenience, never a spawn failure */
