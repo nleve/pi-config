@@ -44,8 +44,10 @@ import {
 	findIdentity,
 	identityByName,
 	isAlive,
+	mergeIdentity,
 	preferIdentity,
 	pruneDeadIdentities,
+	pruneRecycledIdentities,
 	readIdentities,
 	resolvePaneRef,
 	setIdentityGrouping,
@@ -602,12 +604,10 @@ async function ensureStagePaneLocked(
 	let createdTab = false;
 
 	try {
-		const list = await callHerdr({ args: ["workspace", "list"], timeoutMs: 30000 }, opts.signal);
-		const wsRec = asRecord(list.result);
-		const workspaces = Array.isArray(wsRec?.workspaces)
-			? (wsRec.workspaces as Record<string, unknown>[])
-			: [];
-		workspaceId = workspaces.find((w) => w.label === group)?.workspace_id as string | undefined;
+		// Resolve an existing same-label workspace deterministically (lowest id),
+		// matching the create-race convergence below; otherwise one group could
+		// split across two same-label workspaces depending on list order.
+		workspaceId = (await listWorkspaceIds(group, opts.signal))?.[0];
 
 		if (!workspaceId) {
 			const args = ["workspace", "create", "--label", group, "--no-focus"];
@@ -632,7 +632,6 @@ async function ensureStagePaneLocked(
 						created_workspace: true,
 						created_tab: false,
 					},
-					opts.signal,
 				);
 				workspaceId = winner;
 				tabId = undefined;
@@ -645,6 +644,17 @@ async function ensureStagePaneLocked(
 			await callHerdr({ args: ["tab", "rename", tabId, stage], timeoutMs: 10000 }, opts.signal).catch(
 				() => {},
 			);
+			// A peer may have created and adopted a same-label stage tab before our
+			// rename landed; converge on the lowest id, exactly like the tab-create
+			// race below, so one stage does not end up with two tabs.
+			const winner = await convergeLowestId(
+				() => listStageTabIds(workspaceId!, stage, opts.signal),
+				tabId,
+			);
+			if (winner && winner !== tabId) {
+				tabId = winner;
+				paneId = undefined;
+			}
 		} else if (workspaceId) {
 			const tabs = await callHerdr(
 				{ args: ["tab", "list", "--workspace", workspaceId], timeoutMs: 30000 },
@@ -675,7 +685,6 @@ async function ensureStagePaneLocked(
 							created_workspace: false,
 							created_tab: true,
 						},
-						opts.signal,
 					);
 					tabId = winner;
 					paneId = undefined;
@@ -718,7 +727,6 @@ async function ensureStagePaneLocked(
 				created_workspace: createdWorkspace,
 				created_tab: createdTab,
 			},
-			opts.signal,
 		);
 		throw error;
 	}
@@ -745,11 +753,20 @@ function releaseName(name: string): void {
 	pendingNames.delete(name);
 }
 
-/** Drop a reservation once the worker at `paneId` has registered (bounded). */
-function releaseNameWhenRegistered(name: string, paneId: string): void {
+/**
+ * Drop a reservation once the expected worker at `paneId` has registered
+ * (bounded). Matches the worker, not just any entry at the pane, so a recycled
+ * pane's dormant identity does not free the name before our worker appears.
+ */
+function releaseNameWhenRegistered(
+	name: string,
+	paneId: string,
+	expected?: { session_path?: string; startedAt?: number },
+): void {
 	void (async () => {
 		for (let attempt = 0; attempt < 12; attempt++) {
-			if (readIdentities().some((i) => i.pane_id === paneId)) break;
+			const found = identityForPane(paneId);
+			if (found && matchesExpectedWorker(found, expected)) break;
 			await new Promise((r) => setTimeout(r, 250));
 		}
 		releaseName(name);
@@ -881,6 +898,15 @@ async function startAgentWithName(opts: {
 }): Promise<{ agent: Record<string, unknown> | undefined; name: string }> {
 	const { params, paneId, agentArgsFor, signal } = opts;
 	let candidate = opts.name;
+	// Only an agent this call started may be renamed on a name-taken error. If
+	// the pane already hosts an agent (a caller-supplied pane), the collision is
+	// elsewhere and renaming the occupant would corrupt an unrelated worker.
+	let paneWasEmpty = false;
+	try {
+		await getAgent(paneId, { signal });
+	} catch {
+		paneWasEmpty = true;
+	}
 	for (let attempt = 0; attempt < 6; attempt++) {
 		const agentArgs = agentArgsFor(candidate);
 		try {
@@ -911,21 +937,28 @@ async function startAgentWithName(opts: {
 			releaseName(previous);
 			reserveName(candidate);
 			// The failed start may have registered the agent before rejecting the
-			// duplicate name; renaming it in place avoids a second start.
-			try {
-				await callHerdr(
-					{ args: ["agent", "rename", paneId, candidate], timeoutMs: 10000 },
-					signal,
-				);
-				let agent: Record<string, unknown> | undefined;
+			// duplicate name; renaming it in place avoids a second start. Only do
+			// that when the pane was empty before this call and still holds the name
+			// we just tried, so an unrelated occupant is never renamed.
+			if (paneWasEmpty) {
 				try {
-					agent = (await getAgent(paneId, { signal })) as unknown as Record<string, unknown>;
+					const current = await getAgent(paneId, { signal });
+					if (current.name === previous) {
+						await callHerdr(
+							{ args: ["agent", "rename", paneId, candidate], timeoutMs: 10000 },
+							signal,
+						);
+						let agent: Record<string, unknown> | undefined;
+						try {
+							agent = (await getAgent(paneId, { signal })) as unknown as Record<string, unknown>;
+						} catch {
+							/* renamed, but live info is unavailable; still a success */
+						}
+						return { agent, name: candidate };
+					}
 				} catch {
-					/* renamed, but live info is unavailable; still a success */
+					/* cannot confirm the pane's agent is ours — retry the start */
 				}
-				return { agent, name: candidate };
-			} catch {
-				/* no agent at the pane yet — retry the start with the fresh name */
 			}
 		}
 	}
@@ -962,26 +995,47 @@ function identityForPane(paneId: string): AgentIdentity | undefined {
 	return found;
 }
 
-/** Stamp group/stage onto a freshly-started worker's identity (it registers itself first). */
-async function recordGrouping(paneId: string, group: string, stage: string): Promise<void> {
-	for (let attempt = 0; attempt < 8; attempt++) {
+/**
+ * Poll for a freshly-started worker's identity to land, then apply `stamp`.
+ * The worker registers itself asynchronously and a slow worker can take longer
+ * than a couple of seconds to answer its first turn, so the grouping stamp and
+ * the parent link share one deadline. `expected` rejects a recycled pane's
+ * dormant entry so a stale session is never stamped.
+ */
+async function stampWhenRegistered(
+	paneId: string,
+	expected: { session_path?: string; startedAt?: number } | undefined,
+	stamp: (found: AgentIdentity) => void,
+): Promise<void> {
+	const deadline = Date.now() + 30000;
+	while (Date.now() < deadline) {
 		const found = identityForPane(paneId);
-		if (found) {
-			setIdentityGrouping(found, group, stage);
+		if (found && matchesExpectedWorker(found, expected)) {
+			stamp(found);
 			return;
 		}
-		await new Promise((r) => setTimeout(r, 250));
+		await new Promise((r) => setTimeout(r, 500));
 	}
+}
+
+/** Stamp group/stage onto a freshly-started worker's identity (it registers itself first). */
+async function recordGrouping(
+	paneId: string,
+	group: string,
+	stage: string,
+	expected?: { session_path?: string; startedAt?: number },
+): Promise<void> {
+	await stampWhenRegistered(paneId, expected, (found) => setIdentityGrouping(found, group, stage));
 }
 
 /**
  * Stamp the spawning orchestrator onto a freshly-started worker's identity.
- * The worker registers itself asynchronously, so poll (`identityForPane`) for a
- * bounded ~2s before linking, and only link the expected worker: a recycled
- * pane can still hold the previous session's dormant entry, so when we know the
- * new worker's `session_path` (or a start timestamp) require it to match before
- * writing. Best-effort: a missing registry entry or a write failure must never
- * fail the spawn.
+ * The worker registers itself asynchronously, so poll (`identityForPane`) for
+ * the shared registration deadline before linking, and only link the expected
+ * worker: a recycled pane can still hold the previous session's dormant entry,
+ * so when we know the new worker's `session_path` (or a start timestamp)
+ * require it to match before writing. Best-effort: a missing registry entry or
+ * a write failure must never fail the spawn.
  */
 async function stampParent(
 	paneId: string | undefined,
@@ -989,18 +1043,10 @@ async function stampParent(
 	expected?: { session_path?: string; startedAt?: number },
 ): Promise<void> {
 	if (!paneId) return;
-	// A worker that is slow to answer its first turn can take longer than a
-	// couple of seconds to register, so poll up to herdr's come-up budget.
-	const deadline = Date.now() + 30000;
 	try {
-		while (Date.now() < deadline) {
-			const found = identityForPane(paneId);
-			if (found && matchesExpectedWorker(found, expected)) {
-				setIdentityParent(paneId, parent);
-				return;
-			}
-			await new Promise((r) => setTimeout(r, 500));
-		}
+		await stampWhenRegistered(paneId, expected, (found) =>
+			setIdentityParent(found.session_id ?? found.session_path ?? found.pane_id, parent),
+		);
 	} catch {
 		/* best-effort: the parent link is a convenience, never a spawn failure */
 	}
@@ -1069,6 +1115,7 @@ export async function spawnAgent(
 	let name = "";
 	let baselineSeq: number | undefined;
 	let sessionPath: string | undefined;
+	let startedAt = 0;
 
 	try {
 		// Placement: with `group`, share one workspace per workflow (label=group)
@@ -1099,6 +1146,10 @@ export async function spawnAgent(
 		// start below fails and we roll the placement back.
 		if (paneId) onPanePlaced?.(paneId);
 
+		// Timestamp before the start so the registration stamps can reject a stale
+		// recycled-pane identity when the session path is unknown.
+		startedAt = Date.now();
+
 		// Mint the name after placement against the freshest registry, so parallel
 		// spawns in the same stage do not all compute `<group>-<stage>-1`.
 		name = chooseName(params, group, stage);
@@ -1125,13 +1176,16 @@ export async function spawnAgent(
 			: undefined;
 
 		if (group && paneId) {
-			await recordGrouping(paneId, group, stage ?? "main");
+			await recordGrouping(paneId, group, stage ?? "main", {
+				session_path: sessionPath,
+				startedAt,
+			}).catch(() => {});
 			await labelGroupedPane(paneId, workspaceId, group, stage ?? "main", name, signal);
 		}
 	} catch (error) {
 		releaseName(name);
-		if (placed) await rollbackPlacement(placed, signal);
-		else if (createdWorkspaceId) await rollbackWorkspace(createdWorkspaceId, signal);
+		if (placed) await rollbackPlacement(placed);
+		else if (createdWorkspaceId) await rollbackWorkspace(createdWorkspaceId);
 		throw error;
 	} finally {
 		await restoreFocus(priorFocus);
@@ -1139,7 +1193,7 @@ export async function spawnAgent(
 
 	// The worker owns the name once it has registered; drop our in-flight
 	// reservation then, bounded so a slow registration cannot leak it.
-	if (paneId) releaseNameWhenRegistered(name, paneId);
+	if (paneId) releaseNameWhenRegistered(name, paneId, { session_path: sessionPath, startedAt });
 
 	let prompted = false;
 	let promptError: string | undefined;
@@ -1471,35 +1525,57 @@ export default function herdrExtension(pi: ExtensionAPI) {
 
 	function registerSelf(ctx: ExtensionContext, resolvedName?: string): void {
 		if (!selfPane) return;
-		pruneDeadIdentities();
+		// Registry maintenance is best-effort: an FS error must never propagate
+		// into the pi event handler and skip IRC/autocomplete setup.
+		try {
+			pruneDeadIdentities();
+		} catch {
+			/* best-effort */
+		}
+		try {
+			pruneRecycledIdentities();
+		} catch {
+			/* best-effort */
+		}
 		const sessionId = ctx.sessionManager.getSessionId();
-		// Re-read immediately before writing (synchronously, so nothing can
-		// interleave): prefer the entry that owns this session, and only inherit
-		// group/stage from an entry whose session_id is ours — a recycled pane
-		// must not adopt a dead session's grouping.
+		const sessionPath = ctx.sessionManager.getSessionFile();
+		// Re-read synchronously just before writing: inherit group/stage/parent
+		// only from an entry whose session_id is ours — a recycled pane must not
+		// adopt a dead session's grouping.
 		const known = readIdentities();
 		const bySession = known.find((i) => i.session_id === sessionId);
-		let byPane: AgentIdentity | undefined;
-		for (const id of known) if (id.pane_id === selfPane) byPane = preferIdentity(byPane, id);
 		const inherit = bySession && bySession.session_id === sessionId ? bySession : undefined;
-		const prior = bySession ?? byPane;
-		writeIdentity({
+		const owned = {
 			pane_id: selfPane,
 			name: resolvedName ?? ownName(),
-			session_path: ctx.sessionManager.getSessionFile(),
+			session_path: sessionPath,
 			session_id: sessionId,
 			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 			thinking: ctx.thinkingLevel,
 			cwd: ctx.cwd,
-			group: inherit?.group,
-			stage: inherit?.stage,
-			parent_session_id: inherit?.parent_session_id,
-			parent_pane_id: inherit?.parent_pane_id,
-			parent_name: inherit?.parent_name,
 			pid: process.pid,
-			started_at: prior?.started_at ?? Date.now(),
-			updated_at: Date.now(),
-		});
+			started_at: inherit?.started_at ?? Date.now(),
+		};
+		try {
+			// Merge only the fields this writer owns so a concurrent orchestrator's
+			// group/stage/parent stamp is not clobbered (cross-process lost update).
+			const key = sessionId ?? sessionPath ?? selfPane;
+			if (!mergeIdentity(key, owned)) {
+				// No file yet (first registration): write the full object, carrying
+				// over any grouping/parent link already known for this session.
+				writeIdentity({
+					...owned,
+					group: inherit?.group,
+					stage: inherit?.stage,
+					parent_session_id: inherit?.parent_session_id,
+					parent_pane_id: inherit?.parent_pane_id,
+					parent_name: inherit?.parent_name,
+					updated_at: Date.now(),
+				});
+			}
+		} catch {
+			/* best-effort: never let a registry FS error break the event handler */
+		}
 	}
 
 	function identities(): AgentIdentity[] {
@@ -1756,9 +1832,18 @@ export default function herdrExtension(pi: ExtensionAPI) {
 				: rawParams;
 			if (params.action === "spawn") {
 				const startedAt = Date.now();
-				const outcome = await spawnAgent(params, signal, modelArgsFor(params), (pane) =>
-					spawned.add(pane),
-				);
+				let placedPane: string | undefined;
+				let outcome: SpawnOutcome;
+				try {
+					outcome = await spawnAgent(params, signal, modelArgsFor(params), (pane) => {
+						placedPane = pane;
+						spawned.add(pane);
+					});
+				} catch (error) {
+					// spawnAgent rolled back its placement; drop the pane from scope too.
+					if (placedPane) spawned.delete(placedPane);
+					throw error;
+				}
 				// Durable ledger + parent link. Best-effort: a ledger/registry failure
 				// must not fail an otherwise-successful spawn.
 				try {
@@ -1929,7 +2014,10 @@ export default function herdrExtension(pi: ExtensionAPI) {
 					effectiveName = started.name;
 					result = { agent: started.agent };
 					if (group) {
-						await recordGrouping(target, group, stage ?? "main");
+						await recordGrouping(target, group, stage ?? "main", {
+							session_path: sessionPathOf(started.agent as { agent_session?: unknown }),
+							startedAt,
+						}).catch(() => {});
 						await labelGroupedPane(
 							target,
 							placed?.workspace_id,
@@ -1941,13 +2029,14 @@ export default function herdrExtension(pi: ExtensionAPI) {
 					}
 				} catch (error) {
 					releaseName(effectiveName);
-					if (placed) await rollbackPlacement(placed, signal);
+					if (placed && paneId) spawned.delete(paneId);
+					if (placed) await rollbackPlacement(placed);
 					throw error;
 				} finally {
 					await restoreFocus(priorFocus);
 				}
 				// The worker owns the name once it has registered; bounded release.
-				if (paneId && effectiveName) releaseNameWhenRegistered(effectiveName, paneId);
+				if (paneId && effectiveName) releaseNameWhenRegistered(effectiveName, paneId, { startedAt });
 				// Durable ledger + parent link for every started worker (grouped or
 				// not). Best-effort: a ledger/registry failure must not fail an
 				// otherwise-successful start.
