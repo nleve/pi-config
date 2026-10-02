@@ -5,8 +5,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+	identityByName,
 	identityFile,
 	pruneDeadIdentities,
+	pruneRecycledIdentities,
 	readIdentities,
 	removeIdentity,
 	resolvePaneRef,
@@ -88,6 +90,48 @@ writeIdentity(ident({ pane_id: "w3:pLive", name: "live", pid: process.pid }), di
 const removed = pruneDeadIdentities(dir);
 check("prune removes dead pid only", removed === 1);
 check("prune keeps live pid", readIdentities(dir).some((i) => i.name === "live"));
+
+// Recycled panes: several identities share a pane_id but have different session
+// keys. The join must prefer the live/current entry and be order-independent.
+const recycled: AgentIdentity[] = [
+	ident({ pane_id: "w9:pR", name: "old-session", pid: 0, session_id: "s-old", updated_at: 100 }),
+	ident({ pane_id: "w9:pR", name: "current", pid: process.pid, session_id: "s-new", updated_at: 200 }),
+];
+const joinOldFirst = withIdentities([{ pane_id: "w9:pR" }], recycled)[0]!;
+const joinNewFirst = withIdentities([{ pane_id: "w9:pR" }], [...recycled].reverse())[0]!;
+check("withIdentities collision prefers live entry", joinOldFirst.name === "current");
+check("withIdentities collision order-independent", joinNewFirst.name === "current");
+
+// An explicit session_id on the record wins even over a live entry.
+const joinedMatch = withIdentities([{ pane_id: "w9:pR", session_id: "s-old" }], recycled)[0]!;
+check("withIdentities prefers record session match", joinedMatch.name === "old-session");
+
+// With no live entry, the most recently updated one wins.
+const dormantPair: AgentIdentity[] = [
+	ident({ pane_id: "w9:pD", name: "older", pid: 0, session_id: "s-1", updated_at: 100 }),
+	ident({ pane_id: "w9:pD", name: "newer", pid: 0, session_id: "s-2", updated_at: 300 }),
+];
+check("withIdentities prefers recent dormant", withIdentities([{ pane_id: "w9:pD" }], dormantPair)[0]!.name === "newer");
+
+// identityByName collisions (same name, different panes) prefer the live entry.
+const nameCollisions: AgentIdentity[] = [
+	ident({ pane_id: "w9:pA", name: "same-name", pid: 0, session_id: "s-a", updated_at: 100 }),
+	ident({ pane_id: "w9:pB", name: "same-name", pid: process.pid, session_id: "s-b", updated_at: 200 }),
+];
+check("identityByName prefers live entry", identityByName(nameCollisions).get("same-name")?.pane_id === "w9:pB");
+check(
+	"identityByName collision order-independent",
+	identityByName([...nameCollisions].reverse()).get("same-name")?.pane_id === "w9:pB",
+);
+
+// pruneRecycledIdentities drops the stale entry sharing a recycled pane.
+const cdir = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-reg-collide-"));
+writeIdentity(ident({ pane_id: "w9:pR", name: "old-session", pid: 0, session_id: "s-old", updated_at: 100 }), cdir);
+writeIdentity(ident({ pane_id: "w9:pR", name: "current", pid: process.pid, session_id: "s-new", updated_at: 200 }), cdir);
+check("pruneRecycledIdentities removes stale", pruneRecycledIdentities(cdir) === 1);
+const survivors = readIdentities(cdir);
+check("pruneRecycledIdentities keeps current", survivors.length === 1 && survivors[0]!.name === "current");
+fs.rmSync(cdir, { recursive: true, force: true });
 
 fs.rmSync(dir, { recursive: true, force: true });
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILED`);

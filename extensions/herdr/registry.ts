@@ -156,10 +156,62 @@ export function pruneDeadIdentities(dir = identityDir(), ttlMs: number = DORMANT
 	return removed;
 }
 
-/** First-wins name index. */
+/**
+ * Deterministically pick the preferred registry entry when several share a key
+ * (e.g. a recycled pane still holds a dormant entry for the old session).
+ * Preference order: the entry whose `session_id` matches `sessionId` (the live
+ * record, when known), then a live pid over a dormant one, then the most
+ * recently updated. The session key breaks remaining ties so the result does
+ * not depend on the order entries are read from disk.
+ */
+function preferIdentity(prev: AgentIdentity | undefined, next: AgentIdentity, sessionId?: string): AgentIdentity {
+	if (!prev) return next;
+	if (sessionId) {
+		const prevMatch = prev.session_id === sessionId;
+		const nextMatch = next.session_id === sessionId;
+		if (prevMatch !== nextMatch) return nextMatch ? next : prev;
+	}
+	const prevAlive = !isDormant(prev);
+	const nextAlive = !isDormant(next);
+	if (prevAlive !== nextAlive) return nextAlive ? next : prev;
+	const prevUpdated = prev.updated_at || 0;
+	const nextUpdated = next.updated_at || 0;
+	if (prevUpdated !== nextUpdated) return nextUpdated > prevUpdated ? next : prev;
+	return identityKey(next) < identityKey(prev) ? next : prev;
+}
+
+/**
+ * Remove stale entries left behind when a pane was recycled: several identities
+ * share one `pane_id` but have different session keys. Keeps the preferred
+ * live/current entry (see `preferIdentity`) and removes the rest. Callers opt
+ * into this; it can drop offline mail for the stale session. Returns the count
+ * removed.
+ */
+export function pruneRecycledIdentities(dir = identityDir()): number {
+	const byPane = new Map<string, AgentIdentity[]>();
+	for (const id of readIdentities(dir)) {
+		const group = byPane.get(id.pane_id);
+		if (group) group.push(id);
+		else byPane.set(id.pane_id, [id]);
+	}
+	let removed = 0;
+	for (const group of byPane.values()) {
+		if (new Set(group.map(identityKey)).size < 2) continue;
+		let keep: AgentIdentity | undefined;
+		for (const id of group) keep = preferIdentity(keep, id);
+		for (const id of group) {
+			if (id === keep) continue;
+			removeIdentity(id, dir);
+			removed++;
+		}
+	}
+	return removed;
+}
+
+/** Name index; duplicate names resolve to the live/current entry, deterministically. */
 export function identityByName(identities: readonly AgentIdentity[]): Map<string, AgentIdentity> {
 	const map = new Map<string, AgentIdentity>();
-	for (const id of identities) if (!map.has(id.name)) map.set(id.name, id);
+	for (const id of identities) map.set(id.name, preferIdentity(map.get(id.name), id));
 	return map;
 }
 
@@ -192,10 +244,18 @@ export function withIdentities<T extends Record<string, unknown>>(
 	records: readonly T[],
 	identities: readonly AgentIdentity[],
 ): T[] {
-	const byPane = new Map(identities.map((i) => [i.pane_id, i]));
+	const byPane = new Map<string, AgentIdentity[]>();
+	for (const id of identities) {
+		const group = byPane.get(id.pane_id);
+		if (group) group.push(id);
+		else byPane.set(id.pane_id, [id]);
+	}
 	return records.map((r) => {
 		const pane = typeof r.pane_id === "string" ? r.pane_id : undefined;
-		const id = pane ? byPane.get(pane) : undefined;
+		const sessionId = typeof r.session_id === "string" ? r.session_id : undefined;
+		let id: AgentIdentity | undefined;
+		const candidates = pane ? byPane.get(pane) : undefined;
+		if (candidates) for (const candidate of candidates) id = preferIdentity(id, candidate, sessionId);
 		if (!id) return r;
 		return {
 			...r,
