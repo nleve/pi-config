@@ -164,7 +164,7 @@ export function pruneDeadIdentities(dir = identityDir(), ttlMs: number = DORMANT
  * recently updated. The session key breaks remaining ties so the result does
  * not depend on the order entries are read from disk.
  */
-function preferIdentity(prev: AgentIdentity | undefined, next: AgentIdentity, sessionId?: string): AgentIdentity {
+export function preferIdentity(prev: AgentIdentity | undefined, next: AgentIdentity, sessionId?: string): AgentIdentity {
 	if (!prev) return next;
 	if (sessionId) {
 		const prevMatch = prev.session_id === sessionId;
@@ -224,10 +224,15 @@ export function identityBySession(identities: readonly AgentIdentity[]): Map<str
 /** Resolve a name (with or without the `^^` prefix), session id, or pane id. */
 export function findIdentity(ref: string, identities: readonly AgentIdentity[]): AgentIdentity | undefined {
 	const key = ref.startsWith("^^") ? ref.slice(2) : ref;
-	for (const id of identities) if (id.name === key) return id;
-	for (const id of identities) if (id.session_id === key) return id;
-	for (const id of identities) if (id.pane_id === key) return id;
-	return undefined;
+	const named = identityByName(identities).get(key);
+	if (named) return named;
+	// A recycled pane/session can have several entries; fold through preferIdentity
+	// so the live/current one wins regardless of readdir order.
+	let best: AgentIdentity | undefined;
+	for (const id of identities) if (id.session_id === key) best = preferIdentity(best, id);
+	if (best) return best;
+	for (const id of identities) if (id.pane_id === key) best = preferIdentity(best, id);
+	return best;
 }
 
 /** `^^name` or a bare registered name → pane id. */

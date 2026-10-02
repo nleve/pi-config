@@ -10,7 +10,7 @@ import { existsSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { messagePath } from "../mailbox.ts";
+import { messagePath, removeMessage } from "../mailbox.ts";
 import { broadcastTargets, formatIrcForModel, IrcNode, ircDir, seenDir, socketPathFor } from "../irc.ts";
 
 let failures = 0;
@@ -187,6 +187,27 @@ const f2 = await A.send(fake, "nudge", { dedupeId: "df1" });
 check("duplicate retry re-nudges the doorbell", doorbells === 2, String(doorbells));
 check("duplicate retry keeps the parked id", f2.env.id === f1.env.id && f2.ack.id === f1.env.id);
 await new Promise<void>((resolve) => fakeServer.close(() => resolve()));
+
+// a duplicate retry whose doorbell makes the recipient drain must still report
+// the parked envelope, not the fresh (never-parked) id: the parked entry is read
+// before ringing, so the drain cannot race the ack
+const racePane = "tst:pRace";
+let drainOnDoorbell = false;
+const raceServer = net.createServer((s) => {
+	if (drainOnDoorbell) removeMessage("raceSess", "dr1");
+	s.write("ok\n", () => s.end());
+});
+await new Promise<void>((resolve) => raceServer.listen(socketPathFor(racePane), resolve));
+const race = { mailboxKey: "raceSess", paneId: racePane, identity: "race" };
+const r1 = await A.send(race, "race", { dedupeId: "dr1" });
+drainOnDoorbell = true; // recipient now unlinks on the doorbell
+const r2 = await A.send(race, "race", { dedupeId: "dr1" });
+check(
+	"duplicate ack survives a doorbell-triggered drain",
+	r2.ack.ack === "duplicate" && r2.ack.id === r1.env.id && r2.env.id === r1.env.id,
+	`${r2.ack.ack} ${r2.ack.id} vs ${r1.env.id}`,
+);
+await new Promise<void>((resolve) => raceServer.close(() => resolve()));
 
 // a session switch must not orphan unconfirmed pane-keyed mail: it is reattached
 // to the durable session mailbox before the key flips

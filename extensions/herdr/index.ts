@@ -41,7 +41,9 @@ import {
 } from "./workflow.ts";
 import {
 	findIdentity,
+	identityByName,
 	isAlive,
+	preferIdentity,
 	pruneDeadIdentities,
 	readIdentities,
 	resolvePaneRef,
@@ -470,6 +472,8 @@ export interface SpawnOutcome {
 	status?: string;
 	/** Present when `wait` was set: structured result from the session transcript. */
 	result?: unknown;
+	/** Set when the worker started but the initial prompt/wait failed; the worker is still live. */
+	error?: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -501,6 +505,70 @@ function withStageLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
 	return run;
 }
 
+/** Pane rows in a workspace, or undefined when the list failed (never guess empty). */
+async function listWorkspacePanes(
+	workspaceId: string,
+	signal?: AbortSignal,
+): Promise<Record<string, unknown>[] | undefined> {
+	const panes = await callHerdr(
+		{ args: ["pane", "list", "--workspace", workspaceId], timeoutMs: 30000 },
+		signal,
+	).catch(() => undefined);
+	if (!panes) return undefined;
+	const rec = asRecord(panes.result);
+	return Array.isArray(rec?.panes) ? (rec.panes as Record<string, unknown>[]) : [];
+}
+
+/** Same-label workspace ids, ascending (undefined when the list failed). */
+async function listWorkspaceIds(label: string, signal?: AbortSignal): Promise<string[] | undefined> {
+	const res = await callHerdr({ args: ["workspace", "list"], timeoutMs: 30000 }, signal).catch(
+		() => undefined,
+	);
+	if (!res) return undefined;
+	const rec = asRecord(res.result);
+	const rows = Array.isArray(rec?.workspaces) ? (rec.workspaces as Record<string, unknown>[]) : [];
+	return rows
+		.filter((w) => w.label === label && typeof w.workspace_id === "string")
+		.map((w) => w.workspace_id as string)
+		.sort();
+}
+
+/** Same-label tab ids in a workspace, ascending (undefined when the list failed). */
+async function listStageTabIds(
+	workspaceId: string,
+	label: string,
+	signal?: AbortSignal,
+): Promise<string[] | undefined> {
+	const res = await callHerdr(
+		{ args: ["tab", "list", "--workspace", workspaceId], timeoutMs: 30000 },
+		signal,
+	).catch(() => undefined);
+	if (!res) return undefined;
+	const rec = asRecord(res.result);
+	const rows = Array.isArray(rec?.tabs) ? (rec.tabs as Record<string, unknown>[]) : [];
+	return rows
+		.filter((t) => t.label === label && typeof t.tab_id === "string")
+		.map((t) => t.tab_id as string)
+		.sort();
+}
+
+/**
+ * Lowest id among a same-label set. We re-check once after a short pause when we
+ * only saw our own create: a peer's concurrent create may not have landed yet.
+ * Bounded to one extra list — never loops.
+ */
+async function convergeLowestId(
+	list: () => Promise<string[] | undefined>,
+	createdId: string | undefined,
+): Promise<string | undefined> {
+	if (!createdId) return undefined;
+	let winner = (await list())?.[0];
+	if (winner !== createdId) return winner;
+	await new Promise((r) => setTimeout(r, 400));
+	winner = (await list())?.[0];
+	return winner;
+}
+
 /**
  * Place a worker in a shared workflow workspace (`group` label) and stage tab
  * (`stage` label), creating either when missing. The first worker in a fresh
@@ -524,122 +592,133 @@ async function ensureStagePaneLocked(
 	stage: string,
 	opts: { cwd?: string; signal?: AbortSignal } = {},
 ): Promise<StagePlacement> {
-	const list = await callHerdr({ args: ["workspace", "list"], timeoutMs: 30000 }, opts.signal);
-	const wsRec = asRecord(list.result);
-	const workspaces = Array.isArray(wsRec?.workspaces)
-		? (wsRec.workspaces as Record<string, unknown>[])
-		: [];
-	let workspaceId = workspaces.find((w) => w.label === group)?.workspace_id as string | undefined;
-	let createdWorkspace = false;
+	let workspaceId: string | undefined;
 	let tabId: string | undefined;
 	let paneId: string | undefined;
+	let createdWorkspace = false;
 	let createdTab = false;
 
-	if (!workspaceId) {
-		const args = ["workspace", "create", "--label", group, "--no-focus"];
-		if (opts.cwd) args.push("--cwd", opts.cwd);
-		const created = await callHerdr({ args, timeoutMs: 120000 }, opts.signal);
-		const rec = asRecord(created.result);
-		const createdId = asRecord(rec?.workspace)?.workspace_id as string | undefined;
-		tabId = asRecord(rec?.tab)?.tab_id as string | undefined;
-		paneId = asRecord(rec?.root_pane)?.pane_id as string | undefined;
-		workspaceId = createdId;
-		createdWorkspace = true;
-		// Another process may have created a same-label workspace concurrently;
-		// converge on the lowest id and close our duplicate, if any.
-		const again = await callHerdr(
-			{ args: ["workspace", "list"], timeoutMs: 30000 },
-			opts.signal,
-		).catch(() => undefined);
-		const againRows = Array.isArray(asRecord(again?.result)?.workspaces)
-			? (asRecord(again?.result)?.workspaces as Record<string, unknown>[])
+	try {
+		const list = await callHerdr({ args: ["workspace", "list"], timeoutMs: 30000 }, opts.signal);
+		const wsRec = asRecord(list.result);
+		const workspaces = Array.isArray(wsRec?.workspaces)
+			? (wsRec.workspaces as Record<string, unknown>[])
 			: [];
-		const winner = againRows
-			.filter((w) => w.label === group && typeof w.workspace_id === "string")
-			.map((w) => w.workspace_id as string)
-			.sort()[0];
-		if (winner && createdId && winner !== createdId) {
-			await callHerdr(
-				{ args: ["workspace", "close", createdId], timeoutMs: 30000 },
-				opts.signal,
-			).catch(() => {});
-			workspaceId = winner;
-			tabId = undefined;
-			paneId = undefined;
-			createdWorkspace = false;
-		}
-	}
+		workspaceId = workspaces.find((w) => w.label === group)?.workspace_id as string | undefined;
 
-	if (createdWorkspace && tabId) {
-		await callHerdr({ args: ["tab", "rename", tabId, stage], timeoutMs: 10000 }, opts.signal).catch(
-			() => {},
-		);
-	} else if (workspaceId) {
-		const tabs = await callHerdr(
-			{ args: ["tab", "list", "--workspace", workspaceId], timeoutMs: 30000 },
-			opts.signal,
-		);
-		const tabsRec = asRecord(tabs.result);
-		const rows = Array.isArray(tabsRec?.tabs) ? (tabsRec.tabs as Record<string, unknown>[]) : [];
-		tabId = rows.find((t) => t.label === stage)?.tab_id as string | undefined;
-		if (!tabId) {
-			const args = ["tab", "create", "--workspace", workspaceId, "--label", stage, "--no-focus"];
+		if (!workspaceId) {
+			const args = ["workspace", "create", "--label", group, "--no-focus"];
 			if (opts.cwd) args.push("--cwd", opts.cwd);
-			const created = await callHerdr({ args, timeoutMs: 60000 }, opts.signal);
+			const created = await callHerdr({ args, timeoutMs: 120000 }, opts.signal);
 			const rec = asRecord(created.result);
-			const createdTabId = asRecord(rec?.tab)?.tab_id as string | undefined;
+			const createdId = asRecord(rec?.workspace)?.workspace_id as string | undefined;
+			tabId = asRecord(rec?.tab)?.tab_id as string | undefined;
 			paneId = asRecord(rec?.root_pane)?.pane_id as string | undefined;
-			createdTab = true;
-			// Same convergence for a racing same-label tab create.
-			const again = await callHerdr(
-				{ args: ["tab", "list", "--workspace", workspaceId], timeoutMs: 30000 },
-				opts.signal,
-			).catch(() => undefined);
-			const againRows = Array.isArray(asRecord(again?.result)?.tabs)
-				? (asRecord(again?.result)?.tabs as Record<string, unknown>[])
-				: [];
-			const winner = againRows
-				.filter((t) => t.label === stage && typeof t.tab_id === "string")
-				.map((t) => t.tab_id as string)
-				.sort()[0];
-			if (winner && createdTabId && winner !== createdTabId) {
-				await callHerdr({ args: ["tab", "close", createdTabId], timeoutMs: 30000 }, opts.signal).catch(
-					() => {},
+			workspaceId = createdId;
+			createdWorkspace = true;
+			// Another process may have created a same-label workspace concurrently;
+			// converge on the lowest id and drop our duplicate unless a sibling has
+			// already moved into it.
+			const winner = await convergeLowestId(() => listWorkspaceIds(group, opts.signal), createdId);
+			if (winner && createdId && winner !== createdId) {
+				await rollbackPlacement(
+					{
+						workspace_id: createdId,
+						tab_id: tabId,
+						pane_id: paneId,
+						created_workspace: true,
+						created_tab: false,
+					},
+					opts.signal,
 				);
-				tabId = winner;
+				workspaceId = winner;
+				tabId = undefined;
 				paneId = undefined;
-				createdTab = false;
-			} else {
-				tabId = createdTabId;
+				createdWorkspace = false;
 			}
 		}
-	}
 
-	if (!workspaceId || !tabId) {
-		throw new Error(`herdr spawn: could not resolve stage '${group}/${stage}' workspace/tab`);
-	}
-	if (!paneId) {
-		const panes = await callHerdr(
-			{ args: ["pane", "list", "--workspace", workspaceId], timeoutMs: 30000 },
+		if (createdWorkspace && tabId) {
+			await callHerdr({ args: ["tab", "rename", tabId, stage], timeoutMs: 10000 }, opts.signal).catch(
+				() => {},
+			);
+		} else if (workspaceId) {
+			const tabs = await callHerdr(
+				{ args: ["tab", "list", "--workspace", workspaceId], timeoutMs: 30000 },
+				opts.signal,
+			);
+			const tabsRec = asRecord(tabs.result);
+			const rows = Array.isArray(tabsRec?.tabs) ? (tabsRec.tabs as Record<string, unknown>[]) : [];
+			tabId = rows.find((t) => t.label === stage)?.tab_id as string | undefined;
+			if (!tabId) {
+				const args = ["tab", "create", "--workspace", workspaceId, "--label", stage, "--no-focus"];
+				if (opts.cwd) args.push("--cwd", opts.cwd);
+				const created = await callHerdr({ args, timeoutMs: 60000 }, opts.signal);
+				const rec = asRecord(created.result);
+				const createdTabId = asRecord(rec?.tab)?.tab_id as string | undefined;
+				paneId = asRecord(rec?.root_pane)?.pane_id as string | undefined;
+				createdTab = true;
+				// Same convergence for a racing same-label tab create.
+				const winner = await convergeLowestId(
+					() => listStageTabIds(workspaceId!, stage, opts.signal),
+					createdTabId,
+				);
+				if (winner && createdTabId && winner !== createdTabId) {
+					await rollbackPlacement(
+						{
+							workspace_id: workspaceId,
+							tab_id: createdTabId,
+							pane_id: paneId,
+							created_workspace: false,
+							created_tab: true,
+						},
+						opts.signal,
+					);
+					tabId = winner;
+					paneId = undefined;
+					createdTab = false;
+				} else {
+					tabId = createdTabId;
+				}
+			}
+		}
+
+		if (!workspaceId || !tabId) {
+			throw new Error(`herdr spawn: could not resolve stage '${group}/${stage}' workspace/tab`);
+		}
+		if (!paneId) {
+			const rows = (await listWorkspacePanes(workspaceId, opts.signal)) ?? [];
+			const base = rows.find((p) => p.tab_id === tabId)?.pane_id as string | undefined;
+			if (!base) throw new Error(`herdr spawn: stage tab ${tabId} has no pane to split`);
+			const args = ["pane", "split", "--pane", base, "--direction", "down"];
+			if (opts.cwd) args.push("--cwd", opts.cwd);
+			const split = await callHerdr({ args, timeoutMs: 30000 }, opts.signal);
+			paneId = asRecord(asRecord(split.result)?.pane)?.pane_id as string | undefined;
+		}
+		if (!paneId) throw new Error(`herdr spawn: could not obtain a pane for '${group}/${stage}'`);
+		return {
+			workspace_id: workspaceId,
+			tab_id: tabId,
+			pane_id: paneId,
+			created_workspace: createdWorkspace,
+			created_tab: createdTab,
+		};
+	} catch (error) {
+		// Close exactly what we created so far — and only if no sibling has since
+		// occupied it — before surfacing the failure, so a mid-way throw cannot
+		// strand a stray same-label workspace/tab.
+		await rollbackPlacement(
+			{
+				workspace_id: workspaceId,
+				tab_id: tabId,
+				pane_id: paneId,
+				created_workspace: createdWorkspace,
+				created_tab: createdTab,
+			},
 			opts.signal,
 		);
-		const panesRec = asRecord(panes.result);
-		const rows = Array.isArray(panesRec?.panes) ? (panesRec.panes as Record<string, unknown>[]) : [];
-		const base = rows.find((p) => p.tab_id === tabId)?.pane_id as string | undefined;
-		if (!base) throw new Error(`herdr spawn: stage tab ${tabId} has no pane to split`);
-		const args = ["pane", "split", "--pane", base, "--direction", "down"];
-		if (opts.cwd) args.push("--cwd", opts.cwd);
-		const split = await callHerdr({ args, timeoutMs: 30000 }, opts.signal);
-		paneId = asRecord(asRecord(split.result)?.pane)?.pane_id as string | undefined;
+		throw error;
 	}
-	if (!paneId) throw new Error(`herdr spawn: could not obtain a pane for '${group}/${stage}'`);
-	return {
-		workspace_id: workspaceId,
-		tab_id: tabId,
-		pane_id: paneId,
-		created_workspace: createdWorkspace,
-		created_tab: createdTab,
-	};
 }
 
 /** How many workers are already registered for a group/stage (for the `-n` suffix). */
@@ -647,12 +726,52 @@ function countStage(group: string, stage: string): number {
 	return readIdentities().filter((i) => i.group === group && i.stage === stage).length;
 }
 
-/** Names reserved by spawns in flight in this process, bridging the registry gap. */
-const pendingNames = new Set<string>();
+/**
+ * Names reserved by spawns in flight in this process, bridging the gap before
+ * the worker's identity file lands. Entries auto-expire so a lost reservation
+ * cannot reserve a name for the process lifetime; callers release promptly.
+ */
+const pendingNames = new Map<string, number>();
+const PENDING_NAME_TTL_MS = 60000;
 
-/** Registry names plus this process's in-flight reservations. */
+function reserveName(name: string): void {
+	pendingNames.set(name, Date.now() + PENDING_NAME_TTL_MS);
+}
+
+function releaseName(name: string): void {
+	pendingNames.delete(name);
+}
+
+/** Drop a reservation once the worker at `paneId` has registered (bounded). */
+function releaseNameWhenRegistered(name: string, paneId: string): void {
+	void (async () => {
+		for (let attempt = 0; attempt < 12; attempt++) {
+			if (readIdentities().some((i) => i.pane_id === paneId)) break;
+			await new Promise((r) => setTimeout(r, 250));
+		}
+		releaseName(name);
+	})();
+}
+
+function pendingNameTaken(name: string): boolean {
+	const expiry = pendingNames.get(name);
+	if (expiry === undefined) return false;
+	if (expiry <= Date.now()) {
+		pendingNames.delete(name);
+		return false;
+	}
+	return true;
+}
+
+/** Registry names plus this process's unexpired in-flight reservations. */
 function takenNames(): Set<string> {
-	return new Set([...readIdentities().map((i) => i.name), ...pendingNames]);
+	const taken = new Set(readIdentities().map((i) => i.name));
+	const now = Date.now();
+	for (const [name, expiry] of pendingNames) {
+		if (expiry > now) taken.add(name);
+		else pendingNames.delete(name);
+	}
+	return taken;
 }
 
 /** Append a numeric suffix until the name is free (herdr's 32-char limit). */
@@ -660,7 +779,7 @@ function numericName(base: string, taken: ReadonlySet<string>): string {
 	for (let k = 2; k < 1000; k++) {
 		const suffix = `-${k}`;
 		const candidate = `${base.slice(0, 32 - suffix.length)}${suffix}`.replace(/-+$/g, "");
-		if (!taken.has(candidate) && !pendingNames.has(candidate)) return candidate;
+		if (!taken.has(candidate) && !pendingNameTaken(candidate)) return candidate;
 	}
 	return `${base.slice(0, 27)}-${Date.now().toString(36)}`.slice(0, 32);
 }
@@ -691,25 +810,47 @@ function chooseName(params: HerdrParams, group: string | undefined, stage: strin
 		: group
 			? stageName(group, stage ?? "main", countStage(group, stage ?? "main") + 1, takenNames())
 			: generateName(takenNames());
-	pendingNames.add(name);
+	reserveName(name);
 	return name;
 }
 
 const NAME_TAKEN_RE = /taken|in use|exists|unique|duplicate|conflict/i;
 
-/** Close whatever placement created, best-effort, when the start fails. */
-async function rollbackPlacement(placed: StagePlacement, signal?: AbortSignal): Promise<void> {
-	try {
-		if (placed.created_workspace) {
+/**
+ * Tear down a placement we own without disturbing siblings: close only our own
+ * pane, then a workspace/tab we created only once it is empty (a peer may have
+ * adopted it and started a live worker in the meantime). Best-effort throughout.
+ */
+async function rollbackPlacement(
+	placed: {
+		workspace_id?: string;
+		tab_id?: string;
+		pane_id?: string;
+		created_workspace: boolean;
+		created_tab: boolean;
+	},
+	signal?: AbortSignal,
+): Promise<void> {
+	if (placed.pane_id) {
+		await callHerdr({ args: ["pane", "close", placed.pane_id], timeoutMs: 30000 }, signal).catch(
+			() => {},
+		);
+	}
+	if (placed.created_workspace && placed.workspace_id) {
+		const panes = await listWorkspacePanes(placed.workspace_id, signal);
+		if (panes && panes.length === 0) {
 			await callHerdr(
 				{ args: ["workspace", "close", placed.workspace_id], timeoutMs: 30000 },
 				signal,
-			);
-		} else if (placed.created_tab) {
-			await callHerdr({ args: ["tab", "close", placed.tab_id], timeoutMs: 30000 }, signal);
+			).catch(() => {});
 		}
-	} catch {
-		/* best-effort cleanup */
+	} else if (placed.created_tab && placed.tab_id && placed.workspace_id) {
+		const panes = await listWorkspacePanes(placed.workspace_id, signal);
+		if (panes && panes.filter((p) => p.tab_id === placed.tab_id).length === 0) {
+			await callHerdr({ args: ["tab", "close", placed.tab_id], timeoutMs: 30000 }, signal).catch(
+				() => {},
+			);
+		}
 	}
 }
 
@@ -756,11 +897,16 @@ async function startAgentWithName(opts: {
 			return { agent: asRecord(asRecord(started.result)?.agent), name: candidate };
 		} catch (error) {
 			const msg = error instanceof Error ? error.message : String(error);
-			if (attempt >= 5 || !NAME_TAKEN_RE.test(msg)) throw error;
+			if (attempt >= 5 || !NAME_TAKEN_RE.test(msg)) {
+				releaseName(candidate);
+				throw error;
+			}
 			const taken = takenNames();
 			taken.add(candidate);
+			const previous = candidate;
 			candidate = numericName(candidate, taken);
-			pendingNames.add(candidate);
+			releaseName(previous);
+			reserveName(candidate);
 			// The failed start may have registered the agent before rejecting the
 			// duplicate name; renaming it in place avoids a second start.
 			try {
@@ -806,10 +952,17 @@ async function labelGroupedPane(
 	).catch(() => {});
 }
 
+/** Preferred registry entry for a pane (recycled panes resolve to the live/current one). */
+function identityForPane(paneId: string): AgentIdentity | undefined {
+	let found: AgentIdentity | undefined;
+	for (const id of readIdentities()) if (id.pane_id === paneId) found = preferIdentity(found, id);
+	return found;
+}
+
 /** Stamp group/stage onto a freshly-started worker's identity (it registers itself first). */
 async function recordGrouping(paneId: string, group: string, stage: string): Promise<void> {
 	for (let attempt = 0; attempt < 8; attempt++) {
-		const found = readIdentities().find((i) => i.pane_id === paneId);
+		const found = identityForPane(paneId);
 		if (found) {
 			setIdentityGrouping(found, group, stage);
 			return;
@@ -930,6 +1083,7 @@ export async function spawnAgent(
 			await labelGroupedPane(paneId, workspaceId, group, stage ?? "main", name, signal);
 		}
 	} catch (error) {
+		releaseName(name);
 		if (placed) await rollbackPlacement(placed, signal);
 		else if (createdWorkspaceId) await rollbackWorkspace(createdWorkspaceId, signal);
 		throw error;
@@ -937,39 +1091,50 @@ export async function spawnAgent(
 		await restoreFocus(priorFocus);
 	}
 
+	// The worker owns the name once it has registered; drop our in-flight
+	// reservation then, bounded so a slow registration cannot leak it.
+	if (paneId) releaseNameWhenRegistered(name, paneId);
+
 	let prompted = false;
+	let promptError: string | undefined;
 	let status: string | undefined;
 	let result: unknown;
 	if (params.prompt) {
-		await callHerdr(
-			{
-				args: buildHerdrArgs({
-					...params,
-					action: "agent_prompt",
-					target: paneId,
-					text: params.prompt,
-					wait: false,
-				}),
-				timeoutMs: (params.timeout ?? 110000) + 15000,
-			},
-			signal,
-		);
-		prompted = true;
-		if (params.wait) {
-			const settled = await waitForTurnSettled(req(paneId, "pane"), {
-				sinceSeq: baselineSeq,
-				timeoutMs: params.timeout ?? 120000,
+		try {
+			await callHerdr(
+				{
+					args: buildHerdrArgs({
+						...params,
+						action: "agent_prompt",
+						target: paneId,
+						text: params.prompt,
+						wait: false,
+					}),
+					timeoutMs: (params.timeout ?? 110000) + 15000,
+				},
 				signal,
-			});
-			status = settled.agent_status;
-			// A transient read/parse failure must not discard the settled status.
-			if (sessionPath) {
-				try {
-					result = (await readSessionResult(sessionPath)) ?? undefined;
-				} catch {
-					result = undefined;
+			);
+			prompted = true;
+			if (params.wait) {
+				const settled = await waitForTurnSettled(req(paneId, "pane"), {
+					sinceSeq: baselineSeq,
+					timeoutMs: params.timeout ?? 120000,
+					signal,
+				});
+				status = settled.agent_status;
+				// A transient read/parse failure must not discard the settled status.
+				if (sessionPath) {
+					try {
+						result = (await readSessionResult(sessionPath)) ?? undefined;
+					} catch {
+						result = undefined;
+					}
 				}
 			}
+		} catch (error) {
+			// The worker started and owns its pane/name; surface the prompt failure
+			// without rolling it back or discarding the placement details.
+			promptError = error instanceof Error ? error.message : String(error);
 		}
 	}
 
@@ -987,6 +1152,7 @@ export async function spawnAgent(
 		session_path: sessionPath,
 		...(status ? { status } : {}),
 		...(result ? { result } : {}),
+		...(promptError ? { error: promptError } : {}),
 	};
 }
 
@@ -1094,7 +1260,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 	 * Unknown names are left literal.
 	 */
 	function expandInstances(text: string): { text: string; refs: { name: string; pane: string }[] } {
-		const byName = new Map(readIdentities().map((i) => [i.name, i]));
+		const byName = identityByName(readIdentities());
 		const names = findInstanceRefs(text, new Set(byName.keys()));
 		if (names.length === 0) return { text, refs: [] };
 		const refs = names.map((name) => ({ name, pane: byName.get(name)!.pane_id }));
@@ -1181,7 +1347,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		const sessionName = pi.getSessionName()?.trim();
 		if (sessionName) return sessionName;
 		const known = readIdentities();
-		const prior = selfPane ? known.find((i) => i.pane_id === selfPane)?.name : undefined;
+		const prior = selfPane ? identityForPane(selfPane)?.name : undefined;
 		if (prior) return prior;
 		const fresh = generateName(new Set(known.map((i) => i.name)));
 		try {
@@ -1241,7 +1407,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		if (!selfPane) return;
 		const name = resolvedName ?? ownName();
 		const dir = projectName(ctx.cwd);
-		const self = identities().find((i) => i.pane_id === selfPane);
+		const self = identityForPane(selfPane);
 		const args = panelMetadataArgs(selfPane, name, {
 			group: self?.group,
 			stage: self?.stage,
@@ -1267,7 +1433,8 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		// must not adopt a dead session's grouping.
 		const known = readIdentities();
 		const bySession = known.find((i) => i.session_id === sessionId);
-		const byPane = known.find((i) => i.pane_id === selfPane);
+		let byPane: AgentIdentity | undefined;
+		for (const id of known) if (id.pane_id === selfPane) byPane = preferIdentity(byPane, id);
 		const inherit = bySession && bySession.session_id === sessionId ? bySession : undefined;
 		const prior = bySession ?? byPane;
 		writeIdentity({
@@ -1686,11 +1853,14 @@ export default function herdrExtension(pi: ExtensionAPI) {
 						);
 					}
 				} catch (error) {
+					releaseName(effectiveName);
 					if (placed) await rollbackPlacement(placed, signal);
 					throw error;
 				} finally {
 					await restoreFocus(priorFocus);
 				}
+				// The worker owns the name once it has registered; bounded release.
+				if (paneId && effectiveName) releaseNameWhenRegistered(effectiveName, paneId);
 				effective = { ...params, name: effectiveName, pane: paneId };
 				args = buildHerdrArgs({ ...effective, agentArgs: agentArgsFor(effectiveName) });
 			} else {

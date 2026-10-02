@@ -539,13 +539,18 @@ export class IrcNode {
 			...(opts.expectsReply === undefined ? {} : { expectsReply: opts.expectsReply }),
 		};
 		const result = enqueue(target.mailboxKey, env);
-		// Ring before the duplicate early-return: a retry must still nudge a live
-		// recipient, and the ack must name the already-parked envelope, not this
-		// fresh id.
+		// Capture the parked envelope *before* ringing: the doorbell triggers the
+		// recipient's drain, which can unlink it before we re-read it, and the ack
+		// must name the actually-parked envelope, not this fresh id.
+		const parked =
+			result === "duplicate" ? listPending(target.mailboxKey).find((i) => i.key === envelopeKey(env)) : undefined;
+		// Ring before the duplicate early-return: a retry must still nudge a live recipient.
 		if (target.paneId && target.paneId !== this.paneId) await ringDoorbell(target.paneId);
 		if (result === "duplicate") {
-			const parked = listPending(target.mailboxKey).find((i) => i.key === envelopeKey(env));
-			const existing = parked?.env ?? env;
+			// A concurrent drain can still win the race; fall back to the sender's
+			// dedupeId, the stable key that names the parked message (a duplicate
+			// implies it is set, since the key defaults to the fresh envelope id).
+			const existing = parked?.env ?? (opts.dedupeId ? { ...env, id: opts.dedupeId } : env);
 			return { env: existing, ack: { ack: "duplicate", id: existing.id } };
 		}
 		return { env, ack: { ack: "mailboxed", id: env.id } };
