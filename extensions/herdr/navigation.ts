@@ -105,15 +105,35 @@ function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-/** The registry identity backing a spawn entry, folding name/pane/session refs. */
-function resolveIdentity(entry: SpawnEntry, identities: readonly AgentIdentity[]): AgentIdentity | undefined {
-	let best: AgentIdentity | undefined;
-	for (const ref of [entry.session_id, entry.pane_id, entry.name]) {
-		if (!ref) continue;
-		const found = findIdentity(ref, identities);
-		if (found) best = preferIdentity(best, found, entry.session_id);
+/**
+ * The registry identity backing a spawn entry, resolved by durable refs only:
+ * the session transcript (id, then path), then the display name. A pane id is
+ * deliberately NOT a ref: herdr recycles panes, so a live occupant of the old
+ * pane must never stand in for the dormant entry.
+ */
+export function resolveIdentity(entry: SpawnEntry, identities: readonly AgentIdentity[]): AgentIdentity | undefined {
+	if (entry.session_id) {
+		const byId = identities.find((id) => id.session_id === entry.session_id);
+		if (byId) return byId;
 	}
-	return best;
+	if (entry.session_path) {
+		const byPath = identities.find((id) => id.session_path === entry.session_path);
+		if (byPath) return byPath;
+	}
+	return entry.name ? findIdentity(entry.name, identities) : undefined;
+}
+
+/**
+ * A worker is live only when the authoritative roster names it, or its registry
+ * identity's pid is alive. Pane-set membership is intentionally ignored: panes
+ * are recycled and `agent list` often omits names, so the pid is the fallback.
+ */
+function workerIsLive(
+	entry: SpawnEntry,
+	identity: AgentIdentity | undefined,
+	liveAgents: { names: Set<string> } | undefined,
+): boolean {
+	return (liveAgents?.names.has(entry.name) ?? false) || (identity !== undefined && isAlive(identity.pid));
 }
 
 function groupStage(entry: SpawnEntry): string | undefined {
@@ -181,31 +201,24 @@ export function registerNavigation(pi: ExtensionAPI): void {
 		ctx.ui.notify(`herdr: ${message(error)}`, "error");
 	}
 
-	/** Focus a live worker, falling back to focusing its pane's workspace. */
+	/**
+	 * Focus a live worker. On `agent focus` failure, only fall back to the
+	 * workspace of the *named* agent; never use a recorded pane id, which herdr
+	 * may have recycled to an unrelated occupant.
+	 */
 	async function focusLive(item: PickerItem): Promise<void> {
 		try {
 			await callHerdr({ args: ["agent", "focus", item.entry.name], timeoutMs: 10000 });
 			return;
 		} catch {
-			/* fall through to the workspace fallback */
+			/* fall through to the named agent's workspace */
 		}
-		const pane = item.identity?.pane_id ?? item.entry.pane_id;
 		let workspace: string | undefined;
-		if (pane) {
-			try {
-				const { result } = await callHerdr({ args: ["pane", "get", pane], timeoutMs: 10000 });
-				workspace = asString(asRecord(asRecord(result)?.pane)?.workspace_id);
-			} catch {
-				/* no pane info; try the agent record below */
-			}
-		}
-		if (!workspace) {
-			try {
-				const { result } = await callHerdr({ args: ["agent", "get", item.entry.name], timeoutMs: 10000 });
-				workspace = asString(asRecord(asRecord(result)?.agent)?.workspace_id);
-			} catch {
-				/* give up below */
-			}
+		try {
+			const { result } = await callHerdr({ args: ["agent", "get", item.entry.name], timeoutMs: 10000 });
+			workspace = asString(asRecord(asRecord(result)?.agent)?.workspace_id);
+		} catch {
+			/* the named agent is not there; do not focus a recycled pane */
 		}
 		if (!workspace) throw new Error(`could not focus ${item.entry.name}`);
 		await callHerdr({ args: ["workspace", "focus", workspace], timeoutMs: 10000 });
@@ -238,19 +251,25 @@ export function registerNavigation(pi: ExtensionAPI): void {
 		const newPane = asString(pane?.pane_id);
 		const tabId = asString(pane?.tab_id);
 		if (!newPane) throw new Error("pane split returned no pane id");
-		const command = `pi --session ${shellQuote(entry.session_path)}`;
-		await callHerdr({ args: ["pane", "run", newPane, command], timeoutMs: 30000 });
-		// `pane run` only types the command and presses Enter, so confirm pi
-		// actually came up before recording the pane. Otherwise a silent failure
-		// would leak the split and append a ledger entry that splits yet another
-		// pane on the next retry.
-		if (!(await waitForAgent(newPane, 15000))) {
+		// Anything after the split can fail; close the fresh pane on any failure so
+		// a rejected `pane run` cannot leak an orphaned split.
+		try {
+			const command = `pi --session ${shellQuote(entry.session_path)}`;
+			await callHerdr({ args: ["pane", "run", newPane, command], timeoutMs: 30000 });
+			// `pane run` only types the command and presses Enter, so confirm pi
+			// actually came up before recording the pane. Otherwise a silent failure
+			// would append a ledger entry that splits yet another pane on the next
+			// retry.
+			if (!(await waitForAgent(newPane, 15000))) {
+				throw new Error(`resumed ${entry.name} did not start in ${newPane}`);
+			}
+			if (tabId) await callHerdr({ args: ["tab", "focus", tabId], timeoutMs: 10000 }).catch(() => {});
+			// Record the new pane only now that the resume is verified.
+			appendSpawnEntry(pi, { ...entry, pane_id: newPane, ts: Date.now() });
+		} catch (error) {
 			await callHerdr({ args: ["pane", "close", newPane], timeoutMs: 10000 }).catch(() => {});
-			throw new Error(`resumed ${entry.name} did not start in ${newPane}; closed the pane`);
+			throw error;
 		}
-		if (tabId) await callHerdr({ args: ["tab", "focus", tabId], timeoutMs: 10000 }).catch(() => {});
-		// Record the new pane only now that the resume is verified.
-		appendSpawnEntry(pi, { ...entry, pane_id: newPane, ts: Date.now() });
 	}
 
 	/** `/children` picker: list spawned agents and open the chosen one. */
@@ -269,13 +288,7 @@ export function registerNavigation(pi: ExtensionAPI): void {
 		const liveAgents = await fetchLiveAgents();
 		const items: PickerItem[] = entries.map((entry) => {
 			const identity = resolveIdentity(entry, identities);
-			const pane = identity?.pane_id ?? entry.pane_id;
-			// Prefer the live roster; only trust the pid when `agent list` failed.
-			const live = liveAgents
-				? (pane !== undefined && liveAgents.panes.has(pane)) || liveAgents.names.has(entry.name)
-				: identity
-					? isAlive(identity.pid)
-					: false;
+			const live = workerIsLive(entry, identity, liveAgents);
 			const meta = [groupStage(entry), entry.model].filter(Boolean).join("  ");
 			const label = `${live ? "●" : "○"} ${entry.name}${meta ? `  ${meta}` : ""}  ${live ? "live" : "closed"}`;
 			return { label, entry, identity, live };
@@ -293,9 +306,12 @@ export function registerNavigation(pi: ExtensionAPI): void {
 			if (item.live) {
 				try {
 					await focusLive(item);
-				} catch {
-					// Liveness can be stale (recycled pid); a failed focus means the
-					// worker is really gone, so offer the resume path instead.
+				} catch (error) {
+					// Re-check liveness before resuming: a transient focus failure on a
+					// worker the roster still lists must not launch a second pi on the
+					// same transcript. Only resume once the worker is confirmed gone.
+					const fresh = await fetchLiveAgents();
+					if (workerIsLive(item.entry, item.identity, fresh ?? liveAgents)) throw error;
 					await resumeClosed(ctx, item.entry);
 				}
 			} else {
@@ -317,17 +333,22 @@ export function registerNavigation(pi: ExtensionAPI): void {
 			ctx.ui.notify("this session has no recorded parent", "info");
 			return;
 		}
+		// Resolve the parent's durable registry identity. A bare pane ref is only
+		// safe while the parent is live and still owns that pane.
+		const parent = own.parent_session_id
+			? findIdentity(own.parent_session_id, identities)
+			: own.parent_name
+				? findIdentity(own.parent_name, identities)
+				: undefined;
 		const targets: string[] = [];
+		// Prefer the name handle; focusing a name cannot hit a recycled pane.
 		if (own.parent_name) targets.push(own.parent_name);
-		if (own.parent_pane_id) targets.push(own.parent_pane_id);
-		if (targets.length === 0 && own.parent_session_id) {
-			// Only the durable session id was stamped; resolve it to a live handle.
-			const parent = findIdentity(own.parent_session_id, identities);
-			if (parent?.name) targets.push(parent.name);
-			if (parent?.pane_id) targets.push(parent.pane_id);
+		else if (parent && isAlive(parent.pid)) targets.push(parent.name);
+		if (own.parent_pane_id && parent && parent.pane_id === own.parent_pane_id && isAlive(parent.pid)) {
+			targets.push(own.parent_pane_id);
 		}
 		if (targets.length === 0) {
-			ctx.ui.notify("herdr: parent session is recorded but not registered", "warning");
+			ctx.ui.notify("herdr: parent is recorded but not live", "warning");
 			return;
 		}
 		for (const target of targets) {

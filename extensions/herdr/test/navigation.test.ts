@@ -2,7 +2,14 @@
  * Navigation spawn-ledger tests. Run: bun test/navigation.test.ts
  */
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { parseSpawnEntry, readSpawnEntries, SPAWN_ENTRY_TYPE, type SpawnEntry } from "../navigation.ts";
+import {
+	parseSpawnEntry,
+	readSpawnEntries,
+	resolveIdentity,
+	SPAWN_ENTRY_TYPE,
+	type SpawnEntry,
+} from "../navigation.ts";
+import { isAlive, type AgentIdentity } from "../registry.ts";
 
 let failures = 0;
 function check(name: string, cond: boolean, detail = "") {
@@ -17,6 +24,17 @@ function branch(entries: unknown[]): ExtensionContext {
 
 function spawn(data: Partial<SpawnEntry> & { name: string; ts: number }): unknown {
 	return { customType: SPAWN_ENTRY_TYPE, data: { action: "spawn", ...data } };
+}
+
+function ident(over: Partial<AgentIdentity>): AgentIdentity {
+	return {
+		pane_id: "w1:p1",
+		name: "amber-otter",
+		pid: 1,
+		started_at: 1,
+		updated_at: 1,
+		...over,
+	};
 }
 
 // parseSpawnEntry keeps known fields and drops everything else.
@@ -56,6 +74,42 @@ const resumed = readSpawnEntries(
 	branch([spawn({ name: "a", ts: 1, pane_id: "w1:old" }), spawn({ name: "a", ts: 7, pane_id: "w1:new" })]),
 );
 check("resume replaces old pane", resumed.length === 1 && resumed[0]!.pane_id === "w1:new");
+
+// H1: a recycled pane's live occupant must not stand in for the entry's own
+// (dormant) identity. resolveIdentity keys off durable refs, never the pane.
+const dormant = ident({
+	pane_id: "w1:p1",
+	name: "amber-otter",
+	session_id: "sess-a",
+	session_path: "/tmp/a.jsonl",
+});
+const occupant = ident({
+	pane_id: "w1:p1",
+	name: "zesty-llama",
+	session_id: "sess-b",
+	session_path: "/tmp/b.jsonl",
+	pid: process.pid,
+});
+check("recycled-pane occupant is live", isAlive(occupant.pid));
+const entry: SpawnEntry = {
+	action: "spawn",
+	name: "amber-otter",
+	session_id: "sess-a",
+	session_path: "/tmp/a.jsonl",
+	pane_id: "w1:p1",
+	ts: 1,
+};
+check("resolveIdentity prefers dormant entry over live recycled occupant", resolveIdentity(entry, [dormant, occupant]) === dormant);
+check(
+	"resolveIdentity matches by session_path",
+	resolveIdentity({ ...entry, name: "renamed-otter", session_id: undefined }, [dormant, occupant]) === dormant,
+);
+// A pane-only entry (no session ref, name not registered) must not resolve to
+// whoever now occupies the pane.
+check(
+	"resolveIdentity does not match a recycled pane by pane id alone",
+	resolveIdentity({ action: "spawn", name: "ghost-worker", pane_id: "w1:p1", ts: 1 }, [occupant]) === undefined,
+);
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
