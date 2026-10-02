@@ -32,6 +32,7 @@ import {
 	type ModelLike,
 } from "./delegates.ts";
 import { generateName, stageName } from "./names.ts";
+import { appendSpawnEntry, registerNavigation } from "./navigation.ts";
 import {
 	aggregateWorkflows,
 	panelMetadataArgs,
@@ -48,6 +49,7 @@ import {
 	readIdentities,
 	resolvePaneRef,
 	setIdentityGrouping,
+	setIdentityParent,
 	withIdentities,
 	writeIdentity,
 	type AgentIdentity,
@@ -972,6 +974,30 @@ async function recordGrouping(paneId: string, group: string, stage: string): Pro
 	}
 }
 
+/**
+ * Stamp the spawning orchestrator onto a freshly-started worker's identity.
+ * The worker registers itself asynchronously, so poll (`identityForPane`) for a
+ * bounded ~2s before linking. Best-effort: a missing registry entry or a write
+ * failure must never fail the spawn.
+ */
+async function stampParent(
+	paneId: string | undefined,
+	parent: { session_id: string; pane_id: string | undefined; name: string },
+): Promise<void> {
+	if (!paneId) return;
+	try {
+		for (let attempt = 0; attempt < 8; attempt++) {
+			if (identityForPane(paneId)) {
+				setIdentityParent(paneId, parent);
+				return;
+			}
+			await new Promise((r) => setTimeout(r, 250));
+		}
+	} catch {
+		/* best-effort: the parent link is a convenience, never a spawn failure */
+	}
+}
+
 /** The workspace the human currently has focused, if any (best-effort). */
 async function focusedWorkspaceId(signal?: AbortSignal): Promise<string | undefined> {
 	try {
@@ -1614,6 +1640,14 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		);
 	}
 
+	// Durable spawn ledger + navigation command. Registered regardless of herdr
+	// availability so the command can still explain an empty/unavailable roster.
+	try {
+		registerNavigation(pi);
+	} catch (error) {
+		console.error("[herdr] navigation registration failed:", error);
+	}
+
 	if (paneId) {
 		const node = new IrcNode({
 			paneId,
@@ -1691,7 +1725,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 			"Only usable when pi runs inside a herdr pane; otherwise the tool reports that it is unavailable.",
 		],
 		parameters: herdrSchema,
-		async execute(_id, rawParams, signal, _onUpdate, _ctx) {
+		async execute(_id, rawParams, signal, _onUpdate, ctx) {
 			if (!herdrAvailable()) {
 				throw new Error(herdrUnavailableReason());
 			}
@@ -1702,6 +1736,28 @@ export default function herdrExtension(pi: ExtensionAPI) {
 				const outcome = await spawnAgent(params, signal, modelArgsFor(params), (pane) =>
 					spawned.add(pane),
 				);
+				// Durable ledger + parent link. Best-effort: a ledger/registry failure
+				// must not fail an otherwise-successful spawn.
+				try {
+					appendSpawnEntry(pi, {
+						action: "spawn",
+						name: outcome.name,
+						pane_id: outcome.pane_id,
+						session_path: outcome.session_path,
+						cwd: params.cwd,
+						model: params.model,
+						group: outcome.group,
+						stage: outcome.stage,
+						ts: Date.now(),
+					});
+					void stampParent(outcome.pane_id, {
+						session_id: ctx.sessionManager.getSessionId(),
+						pane_id: selfPane,
+						name: ownName(),
+					});
+				} catch {
+					/* best-effort */
+				}
 				// Only notify for a spawn that actually ran a prompt; a promptless
 				// worker is idle immediately and would fake "stage complete".
 				if (outcome.prompted && outcome.group && params.notify !== false) {
@@ -1862,6 +1918,30 @@ export default function herdrExtension(pi: ExtensionAPI) {
 				}
 				// The worker owns the name once it has registered; bounded release.
 				if (paneId && effectiveName) releaseNameWhenRegistered(effectiveName, paneId);
+				// Durable ledger + parent link for grouped workers. Best-effort: a
+				// ledger/registry failure must not fail an otherwise-successful start.
+				if (group && paneId) {
+					try {
+						appendSpawnEntry(pi, {
+							action: "agent_start",
+							name: effectiveName,
+							pane_id: paneId,
+							session_path: sessionPathOf(asRecord(result)?.agent as { agent_session?: unknown }),
+							cwd: params.cwd,
+							model: params.model,
+							group,
+							stage,
+							ts: Date.now(),
+						});
+						void stampParent(paneId, {
+							session_id: ctx.sessionManager.getSessionId(),
+							pane_id: selfPane,
+							name: ownName(),
+						});
+					} catch {
+						/* best-effort */
+					}
+				}
 				effective = { ...params, name: effectiveName, pane: paneId };
 				args = buildHerdrArgs({ ...effective, agentArgs: agentArgsFor(effectiveName) });
 			} else {
