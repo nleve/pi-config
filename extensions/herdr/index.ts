@@ -652,8 +652,19 @@ async function ensureStagePaneLocked(
 				tabId,
 			);
 			if (winner && winner !== tabId) {
+				// Adopt the peer's lower-id stage tab and drop our renamed initial tab
+				// (and its root pane) so the stage does not keep two same-label tabs.
+				const strayTab = tabId;
+				const strayPane = paneId;
 				tabId = winner;
 				paneId = undefined;
+				await rollbackPlacement({
+					workspace_id: workspaceId,
+					tab_id: strayTab,
+					pane_id: strayPane,
+					created_workspace: false,
+					created_tab: true,
+				});
 			}
 		} else if (workspaceId) {
 			const tabs = await callHerdr(
@@ -1360,7 +1371,9 @@ export default function herdrExtension(pi: ExtensionAPI) {
 	 * Unknown names are left literal.
 	 */
 	function expandInstances(text: string): { text: string; refs: { name: string; pane: string }[] } {
-		const byName = identityByName(readIdentities());
+		// Only live workers: a dormant entry's pane may have been recycled to an
+		// unrelated agent, so its `^^name → pane` legend would misdirect the model.
+		const byName = identityByName(readIdentities().filter((id) => isAlive(id.pid)));
 		const names = findInstanceRefs(text, new Set(byName.keys()));
 		if (names.length === 0) return { text, refs: [] };
 		const refs = names.map((name) => ({ name, pane: byName.get(name)!.pane_id }));

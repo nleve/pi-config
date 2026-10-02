@@ -88,32 +88,49 @@ export function removeIdentity(
 function withIdentityLock<T>(key: string, dir: string, fn: () => T): T {
 	const lock = `${identityFile(key, dir)}.lock`;
 	fs.mkdirSync(dir, { recursive: true });
+	// A tokened lock lets us verify ownership: a reaper removes a lock only when
+	// its holder is dead (or very stale) AND its content is unchanged, and a
+	// holder removes the lock only while its own token is still the content.
+	const token = JSON.stringify({ pid: process.pid, nonce: `${Date.now()}-${Math.random()}` });
 	const sleeper = new Int32Array(new SharedArrayBuffer(4));
 	const deadline = Date.now() + 2000;
 	let locked = false;
 	while (!locked) {
 		try {
-			fs.closeSync(fs.openSync(lock, "wx"));
-			locked = true;
+			const fd = fs.openSync(lock, "wx");
+			fs.writeSync(fd, token);
+			fs.closeSync(fd);
+			// A reaper may delete and recreate the lock between create and read;
+			// only claim it while our token is still the content.
+			locked = fs.readFileSync(lock, "utf8") === token;
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+			try {
+				const held = fs.readFileSync(lock, "utf8");
+				const holder = JSON.parse(held) as { pid?: number };
+				const dead = typeof holder.pid !== "number" || !isAlive(holder.pid);
+				const stale = Date.now() - fs.statSync(lock).mtimeMs > 5000;
+				// Re-read before unlinking so a freshly recreated live lock is not
+				// deleted out from under its owner.
+				if ((dead || stale) && fs.readFileSync(lock, "utf8") === held) {
+					fs.rmSync(lock, { force: true });
+				}
+			} catch {
+				/* holder vanished or is unreadable; retry */
+			}
 		}
 		if (locked) break;
-		try {
-			if (Date.now() - fs.statSync(lock).mtimeMs > 5000) {
-				fs.rmSync(lock, { force: true });
-				continue;
-			}
-		} catch {
-			continue; // lock vanished between open and stat; retry
-		}
 		if (Date.now() > deadline) break; // best-effort: proceed without the lock
 		Atomics.wait(sleeper, 0, 0, 5);
 	}
 	try {
 		return fn();
 	} finally {
-		if (locked) fs.rmSync(lock, { force: true });
+		try {
+			if (fs.readFileSync(lock, "utf8") === token) fs.rmSync(lock, { force: true });
+		} catch {
+			/* lock already gone or now belongs to another holder */
+		}
 	}
 }
 
