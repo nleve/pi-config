@@ -77,6 +77,21 @@ const blocky = aggregateWorkflows(
 )[0]!;
 check("blocked beats done", blocky.status === "blocked" && blocky.counts.blocked === 1);
 
+// unknown status must never fold into idle: it cannot prove the stage settled
+const unknown = aggregateWorkflows(
+	[
+		live({ pane_id: "w1D:p1", agent_status: "unknown" }),
+		live({ pane_id: "w1D:p2", agent_status: "unknown" }),
+		live({ pane_id: "w1D:p3", agent_status: "idle", workspace_id: "w1D" }),
+	],
+	identities,
+	{ group: "wf", workspaces },
+)[0]!;
+check("unknown counted separately", unknown.counts.unknown === 2 && unknown.counts.idle === 1);
+check("unknown status is not done", unknown.status !== "done", unknown.status);
+const unknownDig = unknown.stages.find((s) => s.stage === "dig")!;
+check("unknown stage is not done", unknownDig.status !== "done", unknownDig.status);
+
 check("empty identities -> no groups", aggregateWorkflows([], [], {}).length === 0);
 
 // --- metadata argv ---------------------------------------------------------

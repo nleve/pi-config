@@ -42,6 +42,8 @@ export interface WorkflowCounts {
 	working: number;
 	blocked: number;
 	dormant: number;
+	/** Live rows whose status we cannot classify as settled (`idle`/`done`). */
+	unknown: number;
 }
 
 export interface WorkflowWorker {
@@ -69,7 +71,7 @@ export interface WorkflowGroup {
 }
 
 function emptyCounts(): WorkflowCounts {
-	return { total: 0, idle: 0, working: 0, blocked: 0, dormant: 0 };
+	return { total: 0, idle: 0, working: 0, blocked: 0, dormant: 0, unknown: 0 };
 }
 
 function addStatus(counts: WorkflowCounts, status: string): void {
@@ -77,13 +79,16 @@ function addStatus(counts: WorkflowCounts, status: string): void {
 	if (status === "working") counts.working++;
 	else if (status === "blocked") counts.blocked++;
 	else if (status === "dormant") counts.dormant++;
-	else counts.idle++; // idle, plus any other live-but-quiet status
+	else if (status === "idle" || status === "done") counts.idle++; // settled, ready for input
+	else counts.unknown++; // `unknown` or an unrecognized status: not settled
 }
 
 /** A stage is done once every member is idle or dormant (no work remains). */
 function statusOf(counts: WorkflowCounts): StageStatus {
 	if (counts.working > 0) return "working";
 	if (counts.blocked > 0) return "blocked";
+	// An unclassifiable member means we cannot know the stage settled; never "done".
+	if (counts.unknown > 0) return "working";
 	if (counts.total > 0 && counts.idle + counts.dormant === counts.total) return "done";
 	return "unknown";
 }
@@ -94,6 +99,7 @@ function mergeCounts(into: WorkflowCounts, from: WorkflowCounts): void {
 	into.working += from.working;
 	into.blocked += from.blocked;
 	into.dormant += from.dormant;
+	into.unknown += from.unknown;
 }
 
 export interface AggregateOptions {
