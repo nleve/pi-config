@@ -7,6 +7,7 @@ import path from "node:path";
 import {
 	identityByName,
 	identityFile,
+	mergeIdentity,
 	pruneDeadIdentities,
 	pruneRecycledIdentities,
 	readIdentities,
@@ -98,6 +99,22 @@ check(
 		reparented.parent_pane_id === "w3:pP",
 );
 
+// mergeIdentity is the locked read-modify-write primitive: it preserves fields
+// it was not given and reports a missing entry (worker not registered yet).
+const mdir = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-reg-merge-"));
+writeIdentity(ident({ pane_id: "w3:pM", name: "merge-target", session_id: "s-merge", group: "g1", model: "m1" }), mdir);
+check("mergeIdentity missing file -> false", mergeIdentity("nope", { group: "x" }, mdir) === false);
+check("mergeIdentity patches existing entry", mergeIdentity("s-merge", { stage: "merge" }, mdir) === true);
+const afterMerge = readIdentities(mdir).find((i) => i.session_id === "s-merge")!;
+check(
+	"mergeIdentity preserves unpatched fields",
+	afterMerge.stage === "merge" &&
+		afterMerge.group === "g1" &&
+		afterMerge.name === "merge-target" &&
+		afterMerge.model === "m1",
+);
+fs.rmSync(mdir, { recursive: true, force: true });
+
 // A recycled pane with two identities: preferIdentity picks the live/current
 // entry deterministically, and only that file is stamped.
 const pdir = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-reg-parent-collide-"));
@@ -122,6 +139,10 @@ check("stageName herdr-safe", /^[a-z][a-z0-9_-]{0,31}$/.test(stageName("Wf 2", "
 check("resolve ^^name", resolvePaneRef("^^brisk-falcon", read) === "w3:pB");
 check("resolve bare name", resolvePaneRef("amber-otter", read) === "w3:pA");
 check("resolve unknown -> undefined", resolvePaneRef("nope", read) === undefined);
+// A dormant entry's pane may have been recycled: never hand back its stale pane.
+const dormantResolve = [ident({ pane_id: "w3:pDorm", name: "dormant-one", pid: 0, session_id: "s-dorm" })];
+check("resolve dormant name -> undefined", resolvePaneRef("^^dormant-one", dormantResolve) === undefined);
+check("resolve dormant pane -> undefined", resolvePaneRef("w3:pDorm", dormantResolve) === undefined);
 
 removeIdentity("w3:pA", dir);
 check("removeIdentity", readIdentities(dir).length === 1);

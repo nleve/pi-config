@@ -79,6 +79,65 @@ export function removeIdentity(
 }
 
 /**
+ * Best-effort exclusive lock around one identity file's read-modify-write. Uses
+ * an `<identityFile>.lock` sibling so separate processes (worker `registerSelf`
+ * vs. orchestrator setters) serialize instead of clobbering each other. Stale
+ * locks (>5s) are reclaimed; after ~2s of contention the operation proceeds
+ * unlocked as a last resort.
+ */
+function withIdentityLock<T>(key: string, dir: string, fn: () => T): T {
+	const lock = `${identityFile(key, dir)}.lock`;
+	fs.mkdirSync(dir, { recursive: true });
+	const sleeper = new Int32Array(new SharedArrayBuffer(4));
+	const deadline = Date.now() + 2000;
+	let locked = false;
+	while (!locked) {
+		try {
+			fs.closeSync(fs.openSync(lock, "wx"));
+			locked = true;
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+		}
+		if (locked) break;
+		try {
+			if (Date.now() - fs.statSync(lock).mtimeMs > 5000) {
+				fs.rmSync(lock, { force: true });
+				continue;
+			}
+		} catch {
+			continue; // lock vanished between open and stat; retry
+		}
+		if (Date.now() > deadline) break; // best-effort: proceed without the lock
+		Atomics.wait(sleeper, 0, 0, 5);
+	}
+	try {
+		return fn();
+	} finally {
+		if (locked) fs.rmSync(lock, { force: true });
+	}
+}
+
+/**
+ * Merge `patch` over the CURRENT on-disk identity file (patch wins) while
+ * holding the identity lock, so a concurrent writer's fields are not lost. The
+ * file is re-read inside the lock and `updated_at` is refreshed. Returns false
+ * when the file does not exist.
+ */
+export function mergeIdentity(key: string, patch: Partial<AgentIdentity>, dir = identityDir()): boolean {
+	return withIdentityLock(key, dir, () => {
+		let parsed: AgentIdentity;
+		try {
+			parsed = JSON.parse(fs.readFileSync(identityFile(key, dir), "utf8")) as AgentIdentity;
+		} catch {
+			return false;
+		}
+		const merged = { ...parsed, ...patch, updated_at: Date.now() };
+		writeIdentity(merged, dir);
+		return true;
+	});
+}
+
+/**
  * Merge workflow `group`/`stage` into an existing identity file. The worker does
  * not know its own grouping (the orchestrator chose it), so the spawner writes
  * it here after the worker has registered. No-op (returns false) if the entry is
@@ -91,53 +150,38 @@ export function setIdentityGrouping(
 	dir = identityDir(),
 ): boolean {
 	const key = typeof target === "string" ? target : identityKey(target);
-	const file = identityFile(key, dir);
-	let parsed: AgentIdentity;
-	try {
-		parsed = JSON.parse(fs.readFileSync(file, "utf8")) as AgentIdentity;
-	} catch {
-		return false;
-	}
-	if (group === undefined) delete parsed.group;
-	else parsed.group = group;
-	if (stage === undefined) delete parsed.stage;
-	else parsed.stage = stage;
-	parsed.updated_at = Date.now();
-	writeIdentity(parsed, dir);
-	return true;
+	const patch: Partial<AgentIdentity> = {};
+	if (group === undefined) patch.group = undefined;
+	else patch.group = group;
+	if (stage === undefined) patch.stage = undefined;
+	else patch.stage = stage;
+	return mergeIdentity(key, patch, dir);
 }
 
 /**
  * Link a child identity to the orchestrator that spawned it. `paneOrKey` is
  * resolved like `findIdentity`: pane ids fold through `preferIdentity` so a
  * recycled pane's live/current entry wins; otherwise it is treated as an
- * identity key and read directly. Only the provided parent fields are set, so
- * other identity fields are preserved. No-op (returns false) when nothing
- * matches.
+ * identity key. Only the provided parent fields are set (merged over the current
+ * file under a lock), so other identity fields are preserved. No-op (returns
+ * false) when nothing matches.
  */
 export function setIdentityParent(
 	paneOrKey: string,
 	parent: { session_id?: string; pane_id?: string; name?: string },
 	dir = identityDir(),
 ): boolean {
-	let parsed: AgentIdentity | undefined;
+	let resolved: AgentIdentity | undefined;
 	for (const id of readIdentities(dir)) {
 		if (id.pane_id !== paneOrKey) continue;
-		parsed = preferIdentity(parsed, id);
+		resolved = preferIdentity(resolved, id);
 	}
-	if (!parsed) {
-		try {
-			parsed = JSON.parse(fs.readFileSync(identityFile(paneOrKey, dir), "utf8")) as AgentIdentity;
-		} catch {
-			return false;
-		}
-	}
-	if (parent.session_id !== undefined) parsed.parent_session_id = parent.session_id;
-	if (parent.pane_id !== undefined) parsed.parent_pane_id = parent.pane_id;
-	if (parent.name !== undefined) parsed.parent_name = parent.name;
-	parsed.updated_at = Date.now();
-	writeIdentity(parsed, dir);
-	return true;
+	const key = resolved ? identityKey(resolved) : paneOrKey;
+	const patch: Partial<AgentIdentity> = {};
+	if (parent.session_id !== undefined) patch.parent_session_id = parent.session_id;
+	if (parent.pane_id !== undefined) patch.parent_pane_id = parent.pane_id;
+	if (parent.name !== undefined) patch.parent_name = parent.name;
+	return mergeIdentity(key, patch, dir);
 }
 
 export function readIdentities(dir = identityDir()): AgentIdentity[] {
@@ -272,9 +316,15 @@ export function findIdentity(ref: string, identities: readonly AgentIdentity[]):
 	return best;
 }
 
-/** `^^name` or a bare registered name → pane id. */
+/**
+ * `^^name` or a bare registered name → pane id. Dormant entries return
+ * `undefined`: their pane may have been recycled to an unrelated live agent, so
+ * prompting/reading it would hit the wrong worker.
+ */
 export function resolvePaneRef(ref: string, identities: readonly AgentIdentity[]): string | undefined {
-	return findIdentity(ref, identities)?.pane_id;
+	const resolved = findIdentity(ref, identities);
+	if (!resolved || isDormant(resolved)) return undefined;
+	return resolved.pane_id;
 }
 
 /**
