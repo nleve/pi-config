@@ -231,6 +231,8 @@ export class IrcNode {
 	private seenOrder: string[] = [];
 	/** Injected but not yet confirmed persisted, keyed by dedupe key. */
 	private injected = new Map<string, IrcEnvelope>();
+	/** Mailbox keys kept drainable after a key switch left items behind. */
+	private spillover = new Set<string>();
 	private draining = false;
 	private dirty = false;
 
@@ -309,31 +311,69 @@ export class IrcNode {
 	setSession(sessionId: string, identity?: string): void {
 		if (identity) this.identity = identity;
 		if (!sessionId || sessionId === this.mailboxKey) return;
+		const fromKey = this.mailboxKey;
 		// The mailbox key changes from the provisional pane id to the durable
 		// session id. Reattach anything still parked under the old key first, or
-		// unconfirmed pane-keyed mail would be orphaned forever.
-		this.reattachMail(this.mailboxKey, sessionId);
+		// unconfirmed pane-keyed mail would be orphaned forever. If any item
+		// cannot be moved, keep draining the old key so it is not abandoned.
+		if (!this.reattachMail(fromKey, sessionId)) this.spillover.add(fromKey);
 		this.mailboxKey = sessionId;
-		this.seen = new Set();
-		this.seenOrder = [];
-		this.injected.clear();
+		// Carry the pane-keyed dedup ring and the in-flight injection set across
+		// the switch: a dedupeId confirmed or injected under the pane key must
+		// stay suppressed under the session key, or a retry/reattach re-delivers.
 		this.loadSeen();
+		this.adoptSeen(fromKey);
 		void this.drain();
 	}
 
 	/**
 	 * Move pending mail from the provisional pane key to the durable session key
 	 * on a `setSession` switch. The idempotency key is preserved, so a message
-	 * already present in the destination is not copied twice.
+	 * already present in the destination is not copied twice. Returns `false` if
+	 * any item could not be moved, so the caller can keep the old key drainable.
 	 */
-	private reattachMail(fromKey: string, toKey: string): void {
+	private reattachMail(fromKey: string, toKey: string): boolean {
+		let moved = true;
 		for (const { env } of listPending(fromKey)) {
 			try {
 				enqueue(toKey, env);
 				removeMessage(fromKey, envelopeKey(env));
 			} catch (error) {
+				moved = false;
 				console.error("[irc] mailbox reattach failed:", error instanceof Error ? error.message : String(error));
 			}
+		}
+		return moved;
+	}
+
+	/**
+	 * Fold the previous mailbox key's persisted dedup ring into the current one.
+	 * Called on a key switch: a `dedupeId` confirmed under the old key must stay
+	 * suppressed under the new key, so the merged ring is re-persisted there.
+	 */
+	private adoptSeen(fromKey: string): void {
+		if (fromKey === this.mailboxKey) return;
+		try {
+			for (const key of readFileSync(seenPathFor(fromKey), "utf8").split("\n").filter(Boolean)) {
+				if (this.seen.has(key)) continue;
+				this.seen.add(key);
+				this.seenOrder.push(key);
+			}
+		} catch {
+			// no ring under the old key
+		}
+		if (this.seenOrder.length > LOG_CAP) {
+			this.seenOrder = this.seenOrder.slice(-LOG_CAP);
+			this.seen = new Set(this.seenOrder);
+		}
+		try {
+			mkdirSync(seenDir(), { recursive: true });
+			writeFileSync(seenPathFor(this.mailboxKey), this.seenOrder.length ? `${this.seenOrder.join("\n")}\n` : "");
+		} catch (error) {
+			console.error(
+				`[irc] dedup ring migration failed for ${this.mailboxKey}; falling back to in-memory only:`,
+				error instanceof Error ? error.message : String(error),
+			);
 		}
 	}
 
@@ -433,28 +473,32 @@ export class IrcNode {
 		}
 		this.draining = true;
 		try {
-			for (const { key, env } of listPending(this.mailboxKey)) {
-				if (this.seen.has(key)) {
-					removeMessage(this.mailboxKey, key);
-					continue;
-				}
-				if (this.injected.has(key)) {
+			for (const mailbox of [this.mailboxKey, ...this.spillover]) {
+				for (const { key, env } of listPending(mailbox)) {
+					if (this.seen.has(key)) {
+						removeMessage(mailbox, key);
+						continue;
+					}
+					if (this.injected.has(key)) {
+						if (this.isPersisted(env)) this.confirm(key, env);
+						continue; // otherwise leave it for `settle()` to confirm or re-arm
+					}
+					if (this.takeWaiter(env)) {
+						this.confirm(key, env);
+						continue;
+					}
+					this.injected.set(key, env);
+					try {
+						this.opts.deliver(env);
+					} catch (error) {
+						this.injected.delete(key);
+						console.error("[irc] delivery failed:", error instanceof Error ? error.message : String(error));
+						continue;
+					}
 					if (this.isPersisted(env)) this.confirm(key, env);
-					continue; // otherwise leave it for `settle()` to confirm or re-arm
 				}
-				if (this.takeWaiter(env)) {
-					this.confirm(key, env);
-					continue;
-				}
-				this.injected.set(key, env);
-				try {
-					this.opts.deliver(env);
-				} catch (error) {
-					this.injected.delete(key);
-					console.error("[irc] delivery failed:", error instanceof Error ? error.message : String(error));
-					continue;
-				}
-				if (this.isPersisted(env)) this.confirm(key, env);
+				// Drop a stale key once it has nothing left to deliver.
+				if (mailbox !== this.mailboxKey && listPending(mailbox).length === 0) this.spillover.delete(mailbox);
 			}
 		} finally {
 			this.draining = false;
@@ -471,7 +515,16 @@ export class IrcNode {
 
 	private confirm(key: string, env: IrcEnvelope): void {
 		this.recordSeen(key);
-		removeMessage(this.mailboxKey, key);
+		for (const mailbox of [this.mailboxKey, ...this.spillover]) {
+			try {
+				removeMessage(mailbox, key);
+			} catch (error) {
+				console.error(
+					`[irc] failed to unlink delivered mail from ${mailbox}:`,
+					error instanceof Error ? error.message : String(error),
+				);
+			}
+		}
 		this.injected.delete(key);
 		this.log.push(env);
 		if (this.log.length > LOG_CAP) this.log.shift();
@@ -547,10 +600,10 @@ export class IrcNode {
 		// Ring before the duplicate early-return: a retry must still nudge a live recipient.
 		if (target.paneId && target.paneId !== this.paneId) await ringDoorbell(target.paneId);
 		if (result === "duplicate") {
-			// A concurrent drain can still win the race; fall back to the sender's
-			// dedupeId, the stable key that names the parked message (a duplicate
-			// implies it is set, since the key defaults to the fresh envelope id).
-			const existing = parked?.env ?? (opts.dedupeId ? { ...env, id: opts.dedupeId } : env);
+			// A concurrent drain can still win the race and unlink the parked file
+			// before we read it. Its id is then unrecoverable, so ack this attempt's
+			// real envelope id rather than overloading `id` with the dedupe key.
+			const existing = parked?.env ?? env;
 			return { env: existing, ack: { ack: "duplicate", id: existing.id } };
 		}
 		return { env, ack: { ack: "mailboxed", id: env.id } };

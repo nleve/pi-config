@@ -10,7 +10,7 @@ import { existsSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { messagePath, removeMessage } from "../mailbox.ts";
+import { mailboxDir, messagePath, removeMessage } from "../mailbox.ts";
 import { broadcastTargets, formatIrcForModel, IrcNode, ircDir, seenDir, socketPathFor } from "../irc.ts";
 
 let failures = 0;
@@ -209,6 +209,18 @@ check(
 );
 await new Promise<void>((resolve) => raceServer.close(() => resolve()));
 
+// a duplicate whose parked file cannot be matched to the dedupe key must not
+// report the dedupeId as the message id; fall back to the real envelope id
+const tamper = { mailboxKey: "tamperSess", identity: "tamper" };
+const t0 = await A.send(tamper, "dup", { dedupeId: "dt1" });
+writeFileSync(messagePath("tamperSess", "dt1"), `${JSON.stringify({ key: "tampered", env: t0.env })}\n`);
+const t1 = await A.send(tamper, "dup", { dedupeId: "dt1" });
+check(
+	"duplicate without a matchable parked file reports a real id, not the dedupeId",
+	t1.ack.ack === "duplicate" && t1.ack.id !== "dt1" && t1.ack.id === t1.env.id,
+	`${t1.ack.ack} ${t1.ack.id}`,
+);
+
 // a session switch must not orphan unconfirmed pane-keyed mail: it is reattached
 // to the durable session mailbox before the key flips
 let xPersisted = false;
@@ -233,6 +245,70 @@ xPersisted = true;
 await X.settle();
 check("reattached mail confirmed once", !existsSync(messagePath("sessX", "dx1")) && xInbox.length === 1);
 X.stop();
+
+// setSession must carry the pane-keyed dedup ring: a dedupeId confirmed while
+// keyed by pane must stay suppressed after the switch
+const yInbox: string[] = [];
+const Y = new IrcNode({
+	paneId: "tst:pY",
+	identity: "yolanda",
+	deliver: (e) => yInbox.push(e.body),
+});
+await Y.start();
+await A.send({ mailboxKey: "tst:pY", identity: "yolanda" }, "pane-confirmed", { dedupeId: "dy1" });
+await Y.drain();
+check("pane-keyed message delivered before switch", yInbox.length === 1, yInbox.join(","));
+Y.setSession("sessY", "yolanda");
+// a retry under the session key must be suppressed by the carried ring
+await A.send({ mailboxKey: "sessY", identity: "yolanda" }, "pane-confirmed-retry", { dedupeId: "dy1" });
+await Y.drain();
+check("dedupeId still suppressed after setSession", yInbox.length === 1, yInbox.join(","));
+Y.stop();
+
+// setSession must preserve an injected-but-unconfirmed entry: reattaching the
+// file must not inject the same message twice
+let zPersisted = false;
+const zInbox: string[] = [];
+const Z = new IrcNode({
+	paneId: "tst:pZ",
+	identity: "zora",
+	deliver: (e) => zInbox.push(e.body),
+	isPersisted: () => zPersisted,
+});
+await Z.start();
+await A.send({ mailboxKey: "tst:pZ", identity: "zora" }, "pane-injected", { dedupeId: "dz1" });
+await Z.drain();
+check("pane-keyed injected once before switch", zInbox.length === 1, zInbox.join(","));
+Z.setSession("sessZ", "zora");
+check("reattached injection not re-delivered on switch", zInbox.length === 1, zInbox.join(","));
+zPersisted = true;
+await Z.settle();
+check(
+	"carried injection confirms once",
+	zInbox.length === 1 && !existsSync(messagePath("sessZ", "dz1")),
+	zInbox.join(","),
+);
+Z.stop();
+
+// a failed reattach must not orphan mail: the old key stays drainable until the
+// move can complete
+const wInbox: string[] = [];
+const W = new IrcNode({
+	paneId: "tst:pW",
+	identity: "wanda",
+	deliver: (e) => wInbox.push(e.body),
+});
+await W.start();
+await A.send({ mailboxKey: "tst:pW", identity: "wanda" }, "stuck", { dedupeId: "dw1" });
+check("stuck mail parked under pane key", existsSync(messagePath("tst:pW", "dw1")));
+// make the destination mailbox path a file so reattach's enqueue fails
+const blocked = mailboxDir("sessW");
+writeFileSync(blocked, "not a directory");
+W.setSession("sessW", "wanda");
+check("failed reattach still drains the old key", wInbox.includes("stuck"), wInbox.join(","));
+check("failed reattach does not orphan mail", !existsSync(messagePath("tst:pW", "dw1")));
+rmSync(blocked, { force: true });
+W.stop();
 
 // incoming rendering must never demand a reply (omp's anti-ping-pong model)
 const msg = { id: "m1", from: "bob", to: "alice", body: "ping", ts: 0 };
