@@ -13,6 +13,7 @@ import {
 	removeIdentity,
 	resolvePaneRef,
 	setIdentityGrouping,
+	setIdentityParent,
 	withIdentities,
 	writeIdentity,
 	type AgentIdentity,
@@ -69,6 +70,47 @@ const grouped = reread.find((i) => i.pane_id === "w3:pB")!;
 check("grouping persists", grouped.group === "wf" && grouped.stage === "dig");
 check("join surfaces grouping", withIdentities([{ pane_id: "w3:pB" }], reread)[0]!.group === "wf");
 check("setIdentityGrouping missing file -> false", setIdentityGrouping("nope", "x", "y", dir) === false);
+
+// parent orchestrator link: the spawner stamps its own session/pane/name onto
+// the child after the child has registered.
+check("setIdentityParent missing -> false", setIdentityParent("nope", { session_id: "s-parent" }, dir) === false);
+check(
+	"setIdentityParent by pane sets fields",
+	setIdentityParent("w3:pB", { session_id: "s-parent", pane_id: "w3:pP", name: "orchestrator" }, dir) === true,
+);
+const parented = readIdentities(dir).find((i) => i.pane_id === "w3:pB")!;
+check(
+	"parent fields persist",
+	parented.parent_session_id === "s-parent" &&
+		parented.parent_pane_id === "w3:pP" &&
+		parented.parent_name === "orchestrator",
+);
+check(
+	"parent merge preserves existing fields",
+	parented.group === "wf" && parented.stage === "dig" && parented.name === "brisk-falcon" && parented.model === "openai/gpt-5",
+);
+check("setIdentityParent partial update keeps siblings", setIdentityParent("w3:pB", { name: "lead" }, dir) === true);
+const reparented = readIdentities(dir).find((i) => i.pane_id === "w3:pB")!;
+check(
+	"parent partial update only changes provided field",
+	reparented.parent_name === "lead" &&
+		reparented.parent_session_id === "s-parent" &&
+		reparented.parent_pane_id === "w3:pP",
+);
+
+// A recycled pane with two identities: preferIdentity picks the live/current
+// entry deterministically, and only that file is stamped.
+const pdir = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-reg-parent-collide-"));
+writeIdentity(ident({ pane_id: "w9:pR", name: "old-session", pid: 0, session_id: "s-old", updated_at: 100 }), pdir);
+writeIdentity(ident({ pane_id: "w9:pR", name: "current", pid: process.pid, session_id: "s-new", updated_at: 200 }), pdir);
+check("setIdentityParent shared pane -> true", setIdentityParent("w9:pR", { session_id: "s-parent" }, pdir) === true);
+const collide = readIdentities(pdir);
+check(
+	"setIdentityParent shared pane stamps live entry only",
+	collide.find((i) => i.name === "current")?.parent_session_id === "s-parent" &&
+		collide.find((i) => i.name === "old-session")?.parent_session_id === undefined,
+);
+fs.rmSync(pdir, { recursive: true, force: true });
 
 // deterministic workflow names
 check("stageName deterministic", stageName("wf", "dig", 3) === "wf-dig-3");

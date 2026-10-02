@@ -34,6 +34,10 @@ export interface AgentIdentity {
 	group?: string;
 	/** Stage within the group (tab label). */
 	stage?: string;
+	/** Parent orchestrator link; set by the agent that spawned this one. */
+	parent_session_id?: string;
+	parent_pane_id?: string;
+	parent_name?: string;
 	pid: number;
 	started_at: number;
 	updated_at: number;
@@ -98,6 +102,39 @@ export function setIdentityGrouping(
 	else parsed.group = group;
 	if (stage === undefined) delete parsed.stage;
 	else parsed.stage = stage;
+	parsed.updated_at = Date.now();
+	writeIdentity(parsed, dir);
+	return true;
+}
+
+/**
+ * Link a child identity to the orchestrator that spawned it. `paneOrKey` is
+ * resolved like `findIdentity`: pane ids fold through `preferIdentity` so a
+ * recycled pane's live/current entry wins; otherwise it is treated as an
+ * identity key and read directly. Only the provided parent fields are set, so
+ * other identity fields are preserved. No-op (returns false) when nothing
+ * matches.
+ */
+export function setIdentityParent(
+	paneOrKey: string,
+	parent: { session_id?: string; pane_id?: string; name?: string },
+	dir = identityDir(),
+): boolean {
+	let parsed: AgentIdentity | undefined;
+	for (const id of readIdentities(dir)) {
+		if (id.pane_id !== paneOrKey) continue;
+		parsed = preferIdentity(parsed, id);
+	}
+	if (!parsed) {
+		try {
+			parsed = JSON.parse(fs.readFileSync(identityFile(paneOrKey, dir), "utf8")) as AgentIdentity;
+		} catch {
+			return false;
+		}
+	}
+	if (parent.session_id !== undefined) parsed.parent_session_id = parent.session_id;
+	if (parent.pane_id !== undefined) parsed.parent_pane_id = parent.pane_id;
+	if (parent.name !== undefined) parsed.parent_name = parent.name;
 	parsed.updated_at = Date.now();
 	writeIdentity(parsed, dir);
 	return true;
