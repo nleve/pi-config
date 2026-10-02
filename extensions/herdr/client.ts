@@ -14,6 +14,9 @@ import { spawn } from "node:child_process";
 
 export const HERDR_BIN = process.env.HERDR_BIN_PATH || "herdr";
 
+/** How long to wait after SIGTERM before escalating an aborted run to SIGKILL. */
+const ABORT_KILL_GRACE_MS = 2000;
+
 export interface HerdrRun {
 	stdout: string;
 	stderr: string;
@@ -36,26 +39,42 @@ export function runHerdr(args: string[], signal?: AbortSignal, timeoutMs = 12000
 		let stdout = "";
 		let stderr = "";
 		let settled = false;
+		let aborted = false;
+		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		const finish = (fn: () => void) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			if (killTimer) clearTimeout(killTimer);
 			signal?.removeEventListener("abort", onAbort);
 			fn();
 		};
 		const onAbort = () => {
+			if (settled || aborted) return;
+			aborted = true;
 			child.kill("SIGTERM");
-			finish(() => reject(new Error("aborted")));
+			// Escalate if the CLI ignores SIGTERM. The promise settles only once the
+			// child actually exits (the `close` handler below), so callers never
+			// race a still-running process.
+			killTimer = setTimeout(() => child.kill("SIGKILL"), ABORT_KILL_GRACE_MS);
+			killTimer.unref?.();
 		};
 		const timer = setTimeout(() => {
 			child.kill("SIGKILL");
 			finish(() => reject(new Error(`herdr ${args.join(" ")} timed out after ${timeoutMs}ms`)));
 		}, timeoutMs);
-		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) onAbort();
+		else signal?.addEventListener("abort", onAbort, { once: true });
 		child.stdout.on("data", (d) => (stdout += d.toString()));
 		child.stderr.on("data", (d) => (stderr += d.toString()));
 		child.on("error", (err) => finish(() => reject(err)));
-		child.on("close", (code) => finish(() => resolve({ stdout, stderr, code: code ?? 0 })));
+		child.on("close", (code) => {
+			if (aborted) {
+				finish(() => reject(new Error("aborted")));
+				return;
+			}
+			finish(() => resolve({ stdout, stderr, code: code ?? 0 }));
+		});
 	});
 }
 

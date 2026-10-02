@@ -34,6 +34,9 @@ interface ApiEnvelope {
 	error?: { code?: string; message?: string } | string;
 }
 
+/** Agent statuses reported by herdr; `blocked` means the agent awaits input. */
+export type AgentStatus = "idle" | "working" | "blocked" | "done" | "dormant" | "unknown";
+
 /** Call one herdr socket API method and return its unwrapped `result`. */
 export function herdrApi<T = unknown>(
 	method: string,
@@ -151,6 +154,25 @@ export async function waitForAgentStatuses(
  */
 const SETTLED_STATUSES: AgentStatus[] = ["idle", "done"];
 
+/**
+ * Thrown when a target is (or becomes) `blocked` while waiting for it to settle.
+ * A blocked agent waits on input and will not settle on its own, so spinning
+ * the full timeout is useless; callers should surface this promptly.
+ */
+export class HerdrBlockedError extends Error {
+	readonly paneId: string;
+	readonly status = "blocked";
+
+	constructor(paneId: string) {
+		super(
+			`herdr: ${paneId} is blocked waiting for input and will not settle on its own; ` +
+				"unblock or prompt it, then retry",
+		);
+		this.name = "HerdrBlockedError";
+		this.paneId = paneId;
+	}
+}
+
 function isSettled(status: string | undefined): boolean {
 	return status === "idle" || status === "done";
 }
@@ -175,6 +197,7 @@ export async function waitForTurnSettled(
 	for (;;) {
 		if (signal?.aborted) throw new Error("aborted");
 		const info = await getAgent(target, { timeoutMs: 15000, signal });
+		if (info.agent_status === "blocked") throw new HerdrBlockedError(info.pane_id);
 		const seq = typeof info.state_change_seq === "number" ? info.state_change_seq : undefined;
 		const settled = isSettled(info.agent_status);
 		const advanced = sinceSeq === undefined || (seq !== undefined && seq > sinceSeq);
@@ -189,9 +212,13 @@ export async function waitForTurnSettled(
 		// been picked up yet — block until it starts working. Otherwise block until
 		// it finishes (idle or done).
 		const step = Math.min(remaining, settled ? 5000 : remaining);
-		await waitForAgentStatuses(info.pane_id, settled ? ["working"] : SETTLED_STATUSES, {
-			timeoutMs: step,
-			signal,
-		});
+		// Include `blocked` in the wait set so a worker that stalls on input wakes
+		// the wait immediately; the next `getAgent` then throws `HerdrBlockedError`
+		// instead of blocking until the timeout.
+		await waitForAgentStatuses(
+			info.pane_id,
+			settled ? ["working", "blocked"] : [...SETTLED_STATUSES, "blocked"],
+			{ timeoutMs: step, signal },
+		);
 	}
 }
