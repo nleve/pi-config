@@ -261,6 +261,19 @@ function pushFlag(args: string[], flag: string, value: string | number | undefin
 	if (value !== undefined) args.push(flag, String(value));
 }
 
+/** Sanitize a handle to herdr's agent-name charset (`^[a-z][a-z0-9_-]{0,31}$`). */
+function herdrSafeName(raw: string | undefined): string | undefined {
+	if (!raw) return undefined;
+	const s = raw
+		.toLowerCase()
+		.replace(/[^a-z0-9_-]+/g, "-")
+		.replace(/^[^a-z]+/, "")
+		.replace(/-{2,}/g, "-")
+		.replace(/[-_]+$/, "")
+		.slice(0, 32);
+	return /^[a-z][a-z0-9_-]{0,31}$/.test(s) ? s : undefined;
+}
+
 /** Build the herdr argv for a params object. Pure and testable. */
 export function buildHerdrArgs(p: HerdrParams): string[] {
 	const a: string[] = [];
@@ -472,12 +485,41 @@ interface StagePlacement {
 }
 
 /**
+ * In-process serialization of placement, keyed by group/stage. Parallel spawns
+ * for one stage chain onto the same promise instead of racing list→create.
+ */
+const stageLocks = new Map<string, Promise<unknown>>();
+
+function withStageLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+	const prior = stageLocks.get(key) ?? Promise.resolve();
+	const run = prior.then(fn, fn);
+	const guarded = run.catch(() => {});
+	stageLocks.set(key, guarded);
+	void guarded.then(() => {
+		if (stageLocks.get(key) === guarded) stageLocks.delete(key);
+	});
+	return run;
+}
+
+/**
  * Place a worker in a shared workflow workspace (`group` label) and stage tab
  * (`stage` label), creating either when missing. The first worker in a fresh
  * workspace reuses its initial tab (renamed to the stage) instead of orphaning
  * a stray pane; later workers split a pane in the stage tab.
+ *
+ * Placement is serialized per group/stage so parallel spawns cannot each create
+ * a same-label workspace/tab, and each create is followed by a re-list so a
+ * racing caller in another process converges on one shared object.
  */
 async function ensureStagePane(
+	group: string,
+	stage: string,
+	opts: { cwd?: string; signal?: AbortSignal } = {},
+): Promise<StagePlacement> {
+	return withStageLock(`stage:${group}\u0000${stage}`, () => ensureStagePaneLocked(group, stage, opts));
+}
+
+async function ensureStagePaneLocked(
 	group: string,
 	stage: string,
 	opts: { cwd?: string; signal?: AbortSignal } = {},
@@ -498,16 +540,41 @@ async function ensureStagePane(
 		if (opts.cwd) args.push("--cwd", opts.cwd);
 		const created = await callHerdr({ args, timeoutMs: 120000 }, opts.signal);
 		const rec = asRecord(created.result);
-		workspaceId = asRecord(rec?.workspace)?.workspace_id as string | undefined;
+		const createdId = asRecord(rec?.workspace)?.workspace_id as string | undefined;
 		tabId = asRecord(rec?.tab)?.tab_id as string | undefined;
 		paneId = asRecord(rec?.root_pane)?.pane_id as string | undefined;
+		workspaceId = createdId;
 		createdWorkspace = true;
-		if (tabId) {
-			await callHerdr({ args: ["tab", "rename", tabId, stage], timeoutMs: 10000 }, opts.signal).catch(
-				() => {},
-			);
+		// Another process may have created a same-label workspace concurrently;
+		// converge on the lowest id and close our duplicate, if any.
+		const again = await callHerdr(
+			{ args: ["workspace", "list"], timeoutMs: 30000 },
+			opts.signal,
+		).catch(() => undefined);
+		const againRows = Array.isArray(asRecord(again?.result)?.workspaces)
+			? (asRecord(again?.result)?.workspaces as Record<string, unknown>[])
+			: [];
+		const winner = againRows
+			.filter((w) => w.label === group && typeof w.workspace_id === "string")
+			.map((w) => w.workspace_id as string)
+			.sort()[0];
+		if (winner && createdId && winner !== createdId) {
+			await callHerdr(
+				{ args: ["workspace", "close", createdId], timeoutMs: 30000 },
+				opts.signal,
+			).catch(() => {});
+			workspaceId = winner;
+			tabId = undefined;
+			paneId = undefined;
+			createdWorkspace = false;
 		}
-	} else {
+	}
+
+	if (createdWorkspace && tabId) {
+		await callHerdr({ args: ["tab", "rename", tabId, stage], timeoutMs: 10000 }, opts.signal).catch(
+			() => {},
+		);
+	} else if (workspaceId) {
 		const tabs = await callHerdr(
 			{ args: ["tab", "list", "--workspace", workspaceId], timeoutMs: 30000 },
 			opts.signal,
@@ -520,9 +587,31 @@ async function ensureStagePane(
 			if (opts.cwd) args.push("--cwd", opts.cwd);
 			const created = await callHerdr({ args, timeoutMs: 60000 }, opts.signal);
 			const rec = asRecord(created.result);
-			tabId = asRecord(rec?.tab)?.tab_id as string | undefined;
+			const createdTabId = asRecord(rec?.tab)?.tab_id as string | undefined;
 			paneId = asRecord(rec?.root_pane)?.pane_id as string | undefined;
 			createdTab = true;
+			// Same convergence for a racing same-label tab create.
+			const again = await callHerdr(
+				{ args: ["tab", "list", "--workspace", workspaceId], timeoutMs: 30000 },
+				opts.signal,
+			).catch(() => undefined);
+			const againRows = Array.isArray(asRecord(again?.result)?.tabs)
+				? (asRecord(again?.result)?.tabs as Record<string, unknown>[])
+				: [];
+			const winner = againRows
+				.filter((t) => t.label === stage && typeof t.tab_id === "string")
+				.map((t) => t.tab_id as string)
+				.sort()[0];
+			if (winner && createdTabId && winner !== createdTabId) {
+				await callHerdr({ args: ["tab", "close", createdTabId], timeoutMs: 30000 }, opts.signal).catch(
+					() => {},
+				);
+				tabId = winner;
+				paneId = undefined;
+				createdTab = false;
+			} else {
+				tabId = createdTabId;
+			}
 		}
 	}
 
@@ -556,6 +645,165 @@ async function ensureStagePane(
 /** How many workers are already registered for a group/stage (for the `-n` suffix). */
 function countStage(group: string, stage: string): number {
 	return readIdentities().filter((i) => i.group === group && i.stage === stage).length;
+}
+
+/** Names reserved by spawns in flight in this process, bridging the registry gap. */
+const pendingNames = new Set<string>();
+
+/** Registry names plus this process's in-flight reservations. */
+function takenNames(): Set<string> {
+	return new Set([...readIdentities().map((i) => i.name), ...pendingNames]);
+}
+
+/** Append a numeric suffix until the name is free (herdr's 32-char limit). */
+function numericName(base: string, taken: ReadonlySet<string>): string {
+	for (let k = 2; k < 1000; k++) {
+		const suffix = `-${k}`;
+		const candidate = `${base.slice(0, 32 - suffix.length)}${suffix}`.replace(/-+$/g, "");
+		if (!taken.has(candidate) && !pendingNames.has(candidate)) return candidate;
+	}
+	return `${base.slice(0, 27)}-${Date.now().toString(36)}`.slice(0, 32);
+}
+
+/** Sanitize a caller-supplied agent name, or throw a clear validation error. */
+function explicitAgentName(raw: string | undefined): string | undefined {
+	const trimmed = raw?.trim();
+	if (!trimmed) return undefined;
+	const safe = herdrSafeName(trimmed);
+	if (!safe) {
+		throw new Error(
+			`herdr: invalid agent name '${trimmed}' (expected ^[a-z][a-z0-9_-]{0,31}$)`,
+		);
+	}
+	return safe;
+}
+
+/**
+ * Pick the worker's effective name. A grouped spawn derives `<group>-<stage>-<n>`
+ * from the freshly-read registry (plus in-flight reservations) so parallel
+ * callers do not mint the same name; explicit names are sanitized and the
+ * chosen name is reserved until the worker registers.
+ */
+function chooseName(params: HerdrParams, group: string | undefined, stage: string | undefined): string {
+	const explicit = explicitAgentName(params.name);
+	const name = explicit
+		? explicit
+		: group
+			? stageName(group, stage ?? "main", countStage(group, stage ?? "main") + 1, takenNames())
+			: generateName(takenNames());
+	pendingNames.add(name);
+	return name;
+}
+
+const NAME_TAKEN_RE = /taken|in use|exists|unique|duplicate|conflict/i;
+
+/** Close whatever placement created, best-effort, when the start fails. */
+async function rollbackPlacement(placed: StagePlacement, signal?: AbortSignal): Promise<void> {
+	try {
+		if (placed.created_workspace) {
+			await callHerdr(
+				{ args: ["workspace", "close", placed.workspace_id], timeoutMs: 30000 },
+				signal,
+			);
+		} else if (placed.created_tab) {
+			await callHerdr({ args: ["tab", "close", placed.tab_id], timeoutMs: 30000 }, signal);
+		}
+	} catch {
+		/* best-effort cleanup */
+	}
+}
+
+/** Close a workspace an isolated spawn created, best-effort, when the start fails. */
+async function rollbackWorkspace(workspaceId: string, signal?: AbortSignal): Promise<void> {
+	try {
+		await callHerdr({ args: ["workspace", "close", workspaceId], timeoutMs: 30000 }, signal);
+	} catch {
+		/* best-effort cleanup */
+	}
+}
+
+/**
+ * `agent start` with a name-collision retry. herdr enforces unique live names
+ * across processes, so a name minted from a stale registry can lose the race;
+ * on that error we mint a numeric-suffixed name and either rename the agent in
+ * place (if the start had registered it) or retry the start.
+ */
+async function startAgentWithName(opts: {
+	params: HerdrParams;
+	paneId: string;
+	name: string;
+	agentArgsFor: (name: string) => readonly string[];
+	signal?: AbortSignal;
+}): Promise<{ agent: Record<string, unknown> | undefined; name: string }> {
+	const { params, paneId, agentArgsFor, signal } = opts;
+	let candidate = opts.name;
+	for (let attempt = 0; attempt < 6; attempt++) {
+		const agentArgs = agentArgsFor(candidate);
+		try {
+			const started = await callHerdr(
+				{
+					args: buildHerdrArgs({
+						...params,
+						action: "agent_start",
+						name: candidate,
+						pane: paneId,
+						agentArgs,
+					}),
+					timeoutMs: (params.timeout ?? 60000) + 15000,
+				},
+				signal,
+			);
+			return { agent: asRecord(asRecord(started.result)?.agent), name: candidate };
+		} catch (error) {
+			const msg = error instanceof Error ? error.message : String(error);
+			if (attempt >= 5 || !NAME_TAKEN_RE.test(msg)) throw error;
+			const taken = takenNames();
+			taken.add(candidate);
+			candidate = numericName(candidate, taken);
+			pendingNames.add(candidate);
+			// The failed start may have registered the agent before rejecting the
+			// duplicate name; renaming it in place avoids a second start.
+			try {
+				await callHerdr(
+					{ args: ["agent", "rename", paneId, candidate], timeoutMs: 10000 },
+					signal,
+				);
+				let agent: Record<string, unknown> | undefined;
+				try {
+					agent = (await getAgent(paneId, { signal })) as unknown as Record<string, unknown>;
+				} catch {
+					/* renamed, but live info is unavailable; still a success */
+				}
+				return { agent, name: candidate };
+			} catch {
+				/* no agent at the pane yet — retry the start with the fresh name */
+			}
+		}
+	}
+	throw new Error(`herdr spawn: agent name '${opts.name}' stayed taken`);
+}
+
+/** Label a grouped worker's pane and shared workspace in the human's panel. */
+async function labelGroupedPane(
+	paneId: string,
+	workspaceId: string | undefined,
+	group: string,
+	stage: string,
+	name: string,
+	signal?: AbortSignal,
+): Promise<void> {
+	await callHerdr(
+		{ args: panelMetadataArgs(paneId, name, { group, stage }), timeoutMs: 10000 },
+		signal,
+	).catch(() => {});
+	if (!workspaceId) return;
+	const stages = [
+		...new Set(readIdentities().filter((i) => i.group === group).map((i) => i.stage || "main")),
+	];
+	await callHerdr(
+		{ args: workspaceMetadataArgs(workspaceId, { group, stages }), timeoutMs: 10000 },
+		signal,
+	).catch(() => {});
 }
 
 /** Stamp group/stage onto a freshly-started worker's identity (it registers itself first). */
@@ -603,84 +851,91 @@ export async function spawnAgent(
 	params: HerdrParams,
 	signal?: AbortSignal,
 	modelArgs: readonly string[] = [],
+	onPanePlaced?: (paneId: string) => void,
 ): Promise<SpawnOutcome> {
 	const kind = "pi";
 	const mode = params.mode ?? "workspace";
 	const group = params.group?.trim() || undefined;
 	const stage = params.stage?.trim() || (group ? "main" : undefined);
-	const taken = new Set(readIdentities().map((i) => i.name));
-	const name =
-		params.name?.trim() ||
-		(group
-			? stageName(group, stage ?? "main", countStage(group, stage ?? "main") + 1, taken)
-			: generateName(taken));
+	const nested = params.nested === true;
+	// `agent start` (and a default-focus create) moves the human's view; capture
+	// it up front so a failed or successful start can restore it.
+	const priorFocus = await focusedWorkspaceId(signal);
 
-	// Placement: with `group`, share one workspace per workflow (label=group) and
-	// one tab per stage; without it, keep the original isolated workspace/worktree.
 	let paneId: string | undefined;
 	let workspaceId: string | undefined;
-	if (group && mode === "workspace") {
-		const placed = await ensureStagePane(group, stage ?? "main", { cwd: params.cwd, signal });
-		paneId = placed.pane_id;
-		workspaceId = placed.workspace_id;
-	} else {
-		const createAction = mode === "worktree" ? "worktree_create" : "workspace_create";
-		const created = await callHerdr(
-			{ args: buildHerdrArgs({ ...params, action: createAction }), timeoutMs: 120000 },
-			signal,
-		);
-		const createdRec = asRecord(created.result);
-		paneId = asRecord(createdRec?.root_pane)?.pane_id as string | undefined;
-		workspaceId = asRecord(createdRec?.workspace)?.workspace_id as string | undefined;
-		if (!paneId) {
-			throw new Error(
-				`herdr spawn: ${createAction} did not return a root pane id: ${renderHerdrResult(created.result)}`,
-			);
-		}
-	}
+	let placed: StagePlacement | undefined;
+	let createdWorkspaceId: string | undefined;
+	let startedAgent: Record<string, unknown> | undefined;
+	let name = "";
+	let baselineSeq: number | undefined;
+	let sessionPath: string | undefined;
 
-	const nested = params.nested === true;
-	const agentArgs = [
-		...(nested ? [] : ["-xt", "herdr"]),
-		"--name",
-		name,
-		...modelArgs,
-		...(params.agentArgs ?? []),
-	];
-	const priorFocus = group ? await focusedWorkspaceId(signal) : undefined;
-	const started = await callHerdr(
-		{
-			args: buildHerdrArgs({ ...params, action: "agent_start", name, pane: paneId, agentArgs }),
-			timeoutMs: (params.timeout ?? 60000) + 15000,
-		},
-		signal,
-	);
-	const startedAgent = asRecord(asRecord(started.result)?.agent);
-	const baselineSeq =
-		typeof startedAgent?.state_change_seq === "number" ? startedAgent.state_change_seq : undefined;
-	const sessionPath = startedAgent
-		? sessionPathOf(startedAgent as { agent_session?: unknown })
-		: undefined;
-
-	if (group && paneId) {
-		await recordGrouping(paneId, group, stage ?? "main");
-		// Label the pane (and the shared workspace) in the human's panel. The
-		// worker re-asserts its own label each turn, so this cannot drift.
-		await callHerdr(
-			{ args: panelMetadataArgs(paneId, name, { group, stage: stage ?? "main" }), timeoutMs: 10000 },
-			signal,
-		).catch(() => {});
-		if (workspaceId) {
-			const stages = [
-				...new Set(readIdentities().filter((i) => i.group === group).map((i) => i.stage || "main")),
-			];
-			await callHerdr(
-				{ args: workspaceMetadataArgs(workspaceId, { group, stages }), timeoutMs: 10000 },
+	try {
+		// Placement: with `group`, share one workspace per workflow (label=group)
+		// and one tab per stage; without it, keep the original isolated
+		// workspace/worktree.
+		if (group && mode === "workspace") {
+			placed = await ensureStagePane(group, stage ?? "main", { cwd: params.cwd, signal });
+			paneId = placed.pane_id;
+			workspaceId = placed.workspace_id;
+		} else {
+			const createAction = mode === "worktree" ? "worktree_create" : "workspace_create";
+			const created = await callHerdr(
+				{ args: buildHerdrArgs({ ...params, action: createAction }), timeoutMs: 120000 },
 				signal,
-			).catch(() => {});
+			);
+			const createdRec = asRecord(created.result);
+			paneId = asRecord(createdRec?.root_pane)?.pane_id as string | undefined;
+			workspaceId = asRecord(createdRec?.workspace)?.workspace_id as string | undefined;
+			if (!paneId) {
+				throw new Error(
+					`herdr spawn: ${createAction} did not return a root pane id: ${renderHerdrResult(created.result)}`,
+				);
+			}
+			createdWorkspaceId = workspaceId;
 		}
+
+		// Make the new pane visible to the scoped roster immediately, even if the
+		// start below fails and we roll the placement back.
+		if (paneId) onPanePlaced?.(paneId);
+
+		// Mint the name after placement against the freshest registry, so parallel
+		// spawns in the same stage do not all compute `<group>-<stage>-1`.
+		name = chooseName(params, group, stage);
+		const agentArgsFor = (workerName: string): string[] => [
+			...(nested ? [] : ["-xt", "herdr"]),
+			"--name",
+			workerName,
+			...modelArgs,
+			...(params.agentArgs ?? []),
+		];
+		const started = await startAgentWithName({
+			params,
+			paneId: req(paneId, "pane"),
+			name,
+			agentArgsFor,
+			signal,
+		});
+		name = started.name;
+		startedAgent = started.agent;
+		baselineSeq =
+			typeof startedAgent?.state_change_seq === "number" ? startedAgent.state_change_seq : undefined;
+		sessionPath = startedAgent
+			? sessionPathOf(startedAgent as { agent_session?: unknown })
+			: undefined;
+
+		if (group && paneId) {
+			await recordGrouping(paneId, group, stage ?? "main");
+			await labelGroupedPane(paneId, workspaceId, group, stage ?? "main", name, signal);
+		}
+	} catch (error) {
+		if (placed) await rollbackPlacement(placed, signal);
+		else if (createdWorkspaceId) await rollbackWorkspace(createdWorkspaceId, signal);
+		throw error;
+	} finally {
+		await restoreFocus(priorFocus);
 	}
-	await restoreFocus(priorFocus);
 
 	let prompted = false;
 	let status: string | undefined;
@@ -701,13 +956,20 @@ export async function spawnAgent(
 		);
 		prompted = true;
 		if (params.wait) {
-			const settled = await waitForTurnSettled(paneId, {
+			const settled = await waitForTurnSettled(req(paneId, "pane"), {
 				sinceSeq: baselineSeq,
 				timeoutMs: params.timeout ?? 120000,
 				signal,
 			});
 			status = settled.agent_status;
-			if (sessionPath) result = (await readSessionResult(sessionPath)) ?? undefined;
+			// A transient read/parse failure must not discard the settled status.
+			if (sessionPath) {
+				try {
+					result = (await readSessionResult(sessionPath)) ?? undefined;
+				} catch {
+					result = undefined;
+				}
+			}
 		}
 	}
 
@@ -930,18 +1192,6 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		return fresh;
 	}
 
-	function herdrSafeName(raw: string | undefined): string | undefined {
-		if (!raw) return undefined;
-		const s = raw
-			.toLowerCase()
-			.replace(/[^a-z0-9_-]+/g, "-")
-			.replace(/^[^a-z]+/, "")
-			.replace(/-{2,}/g, "-")
-			.replace(/[-_]+$/, "")
-			.slice(0, 32);
-		return /^[a-z][a-z0-9_-]{0,31}$/.test(s) ? s : undefined;
-	}
-
 	/**
 	 * Ensure herdr itself shows a name for this pane. The agents panel renders
 	 * `AgentInfo.name`, which only `agent start` / `agent rename` set. Adopt the
@@ -1010,10 +1260,16 @@ export default function herdrExtension(pi: ExtensionAPI) {
 	function registerSelf(ctx: ExtensionContext, resolvedName?: string): void {
 		if (!selfPane) return;
 		pruneDeadIdentities();
-		const known = readIdentities();
 		const sessionId = ctx.sessionManager.getSessionId();
-		const prior =
-			known.find((i) => i.pane_id === selfPane) ?? known.find((i) => i.session_id === sessionId);
+		// Re-read immediately before writing (synchronously, so nothing can
+		// interleave): prefer the entry that owns this session, and only inherit
+		// group/stage from an entry whose session_id is ours — a recycled pane
+		// must not adopt a dead session's grouping.
+		const known = readIdentities();
+		const bySession = known.find((i) => i.session_id === sessionId);
+		const byPane = known.find((i) => i.pane_id === selfPane);
+		const inherit = bySession && bySession.session_id === sessionId ? bySession : undefined;
+		const prior = bySession ?? byPane;
 		writeIdentity({
 			pane_id: selfPane,
 			name: resolvedName ?? ownName(),
@@ -1022,8 +1278,8 @@ export default function herdrExtension(pi: ExtensionAPI) {
 			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 			thinking: ctx.thinkingLevel,
 			cwd: ctx.cwd,
-			group: prior?.group,
-			stage: prior?.stage,
+			group: inherit?.group,
+			stage: inherit?.stage,
 			pid: process.pid,
 			started_at: prior?.started_at ?? Date.now(),
 			updated_at: Date.now(),
@@ -1144,10 +1400,17 @@ export default function herdrExtension(pi: ExtensionAPI) {
 			const members = identities().filter((i) => i.group === group && (i.stage || "main") === stage);
 			const live = await listAgents("all");
 			const statusByPane = new Map(live.map((a) => [a.pane_id, a.agent_status]));
-			const settled = !members.some((i) => {
-				const s = statusByPane.get(i.pane_id);
-				return s === "working" || s === "blocked";
-			});
+			// Unknown/absent status means "not observed", not "settled": only a live
+			// worker that is idle/done, or a dormant one, counts. Otherwise a
+			// freshly-started (still being detected) worker would fake completion.
+			const settled =
+				members.length > 0 &&
+				members.every((i) => {
+					const s = statusByPane.get(i.pane_id);
+					if (s === "idle" || s === "done") return true;
+					if (s === "working" || s === "blocked") return false;
+					return !isAlive(i.pid);
+				});
 			if (!stageNotified.shouldNotify(key, members.length, settled)) return;
 			const names = members
 				.map((i) => i.name)
@@ -1268,9 +1531,12 @@ export default function herdrExtension(pi: ExtensionAPI) {
 				? { ...rawParams, target: targetResolved(rawParams.target) }
 				: rawParams;
 			if (params.action === "spawn") {
-				const outcome = await spawnAgent(params, signal, modelArgsFor(params));
-				spawned.add(outcome.pane_id);
-				if (outcome.group && params.notify !== false) {
+				const outcome = await spawnAgent(params, signal, modelArgsFor(params), (pane) =>
+					spawned.add(pane),
+				);
+				// Only notify for a spawn that actually ran a prompt; a promptless
+				// worker is idle immediately and would fake "stage complete".
+				if (outcome.prompted && outcome.group && params.notify !== false) {
 					void notifyIfStageDone(outcome.group, outcome.stage ?? "main");
 				}
 				return {
@@ -1286,7 +1552,16 @@ export default function herdrExtension(pi: ExtensionAPI) {
 					signal,
 				});
 				const sessionPath = sessionPathOf(info as { agent_session?: unknown });
-				const result = sessionPath ? await readSessionResult(sessionPath) : undefined;
+				// A transient read/parse failure must not throw away the settled
+				// status; degrade to the no-result path instead.
+				let result: unknown;
+				if (sessionPath) {
+					try {
+						result = await readSessionResult(sessionPath);
+					} catch {
+						result = undefined;
+					}
+				}
 				const out = {
 					pane_id: info.pane_id,
 					name: info.name,
@@ -1360,31 +1635,73 @@ export default function herdrExtension(pi: ExtensionAPI) {
 				};
 			}
 			let effective: HerdrParams = params;
+			let result: unknown;
+			let args: string[] = [];
+			let effectiveName = "";
 			if (params.action === "agent_start") {
 				const group = params.group?.trim() || undefined;
 				const stage = params.stage?.trim() || (group ? "main" : undefined);
-				const taken = new Set(identities().map((i) => i.name));
-				const name =
-					params.name?.trim() ||
-					(group
-						? stageName(group, stage ?? "main", countStage(group, stage ?? "main") + 1, taken)
-						: generateName(taken));
-				effective = {
-					...params,
-					name,
-					agentArgs: ["--name", name, ...modelArgsFor(params), ...(params.agentArgs ?? [])],
-				};
+				const nested = params.nested === true;
+				const modelArgs = modelArgsFor(params);
+				const agentArgsFor = (workerName: string): string[] => [
+					...(nested ? [] : ["-xt", "herdr"]),
+					"--name",
+					workerName,
+					...modelArgs,
+					...(params.agentArgs ?? []),
+				];
+				// `agent start` focuses the new pane; capture/restore the human's
+				// view whether or not the worker is grouped.
+				const priorFocus = await focusedWorkspaceId(signal);
+				let placed: StagePlacement | undefined;
+				let paneId = params.pane;
+				try {
+					if (group) {
+						// A grouped worker must share the group workspace/stage tab
+						// with its peers rather than run in an isolated pane.
+						placed = await ensureStagePane(group, stage ?? "main", { cwd: params.cwd, signal });
+						paneId = placed.pane_id;
+						spawned.add(paneId);
+					}
+					const target = req(paneId, "pane");
+					effectiveName = chooseName(params, group, stage);
+					const started = await startAgentWithName({
+						params,
+						paneId: target,
+						name: effectiveName,
+						agentArgsFor,
+						signal,
+					});
+					effectiveName = started.name;
+					result = { agent: started.agent };
+					if (group) {
+						await recordGrouping(target, group, stage ?? "main");
+						await labelGroupedPane(
+							target,
+							placed?.workspace_id,
+							group,
+							stage ?? "main",
+							started.name,
+							signal,
+						);
+					}
+				} catch (error) {
+					if (placed) await rollbackPlacement(placed, signal);
+					throw error;
+				} finally {
+					await restoreFocus(priorFocus);
+				}
+				effective = { ...params, name: effectiveName, pane: paneId };
+				args = buildHerdrArgs({ ...effective, agentArgs: agentArgsFor(effectiveName) });
+			} else {
+				args = buildHerdrArgs(effective);
+				const timeoutMs = (params.timeout ?? 110000) + 15000;
+				({ result } = await callHerdr({ args, timeoutMs }, signal));
 			}
-			const args = buildHerdrArgs(effective);
-			const timeoutMs = (params.timeout ?? 110000) + 15000;
-			const startGroup = effective.action === "agent_start" ? effective.group?.trim() : undefined;
-			const priorFocus = startGroup ? await focusedWorkspaceId(signal) : undefined;
-			const { result } = await callHerdr({ args, timeoutMs }, signal);
-			if (startGroup && effective.pane) {
-				await recordGrouping(effective.pane, startGroup, effective.stage?.trim() || "main");
-			}
-			await restoreFocus(priorFocus);
 			let scoped = applyScope(params, result, spawned);
+			if (params.action === "agent_start" && effectiveName) {
+				scoped = { ...(asRecord(scoped) ?? {}), name: effectiveName };
+			}
 			if (params.action === "agents") {
 				const rec = asRecord(scoped);
 				let arr = rec && Array.isArray(rec.agents) ? (rec.agents as Record<string, unknown>[]) : undefined;
@@ -1397,7 +1714,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 			}
 			return {
 				content: [{ type: "text", text: renderHerdrResult(scoped) }],
-				details: { action: params.action, args },
+				details: { action: params.action, args, ...(effectiveName ? { name: effectiveName } : {}) },
 			};
 		},
 	});
