@@ -99,3 +99,26 @@ Today `IrcNode.waiters` + mailbox live in-process; an orchestrator crash loses p
 1. Is `reject` worth the ack frame, or keep fire-and-forget `steer`/`followUp` only?
 2. Recipient dedup ring — implement, or require callers never to retry?
 3. For a Durable-backed orchestrator: Reporter-style send task, or is a `codemode` `store()` ledger enough?
+
+---
+
+## 12. Addendum — what shipped (2026-10-01, Phase 6 slice 3)
+
+This spec's vocabulary mapping (§2) and its "IRC stays out-of-process" boundary
+(§1) held. Three things changed during implementation:
+
+- **§3/§9 reject dropped.** Q1 is answered *no*: the transport was reworked to a
+  durable **mailbox** (keyed by session id, atomic `link(2)` publish), so a busy
+  recipient simply defers in the mailbox. There is no synchronous bounce and no
+  ack frame; `mode` is `steer | followUp` only. See `mailbox.ts` and the GOAL
+  Phase 6 slice 3 log.
+- **§9.4 delivery confirmation is stronger than ack frames.** Rather than an
+  in-band ack, the recipient unlinks a message only once it is confirmed present
+  in the session transcript (`ctx.sessionManager.getEntries()`), which fixes the
+  in-memory-queue crash window that motivated the at-least-once note.
+- **§9.4/§9.6 keying.** The mailbox and the dedup ring are keyed by `session_id`
+  (the durable identity), not pane id; senders still address by name. This also
+  retires the "pane recycled inherits the old ring" caveat from `irc.ts`.
+
+Q2 is answered *yes* (ring implemented, keyed by session). Q3 is unchanged —
+still open, and out of scope until Durable is adopted as an orchestrator.

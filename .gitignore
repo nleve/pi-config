@@ -13,3 +13,6 @@ bin/
 # OS / editor noise.
 .DS_Store
 *.log
+
+# herdr durable agent registry (runtime state).
+herdr-agents/

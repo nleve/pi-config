@@ -1,35 +1,25 @@
 /**
- * IRC: agent-to-agent messaging over per-agent unix sockets.
+ * IRC: agent-to-agent messaging over a durable mailbox, with a unix-socket doorbell.
  *
- * pi subagents are separate processes with no shared bus, so IRC is
- * out-of-process. Each agent running this extension listens on its own socket
- * at `$XDG_RUNTIME_DIR/pi-irc/<pane>.sock` (fallback `~/.pi/agent/pi-irc/`).
- * Senders connect, write one JSON envelope per line, and read one JSON ack line.
+ * Pure-mailbox (see GOAL.md Phase 6): a message is written to the recipient's
+ * durable mailbox (keyed by *session id*) and the recipient drains its own
+ * mailbox when it can. The socket carries no message body and no ack semantics;
+ * it is only a doorbell ("you have mail") so a live, idle agent picks mail up
+ * promptly. A dormant recipient's mail waits until its session next runs.
  *
- * Delivery, matching omp's in-process IrcBus semantics:
- *   - a matching `irc_wait` is blocked on the message -> resolve it (tool result)
- *   - `mode: "reject"` while busy -> bounce to the sender (retryable), no delivery
- *   - otherwise the message is injected into the live pi session via
- *     `pi.sendMessage` as `deliverAs: "steer"` when busy, or `followUp` +
- *     `triggerTurn` when idle
+ * Guarantees:
+ *   - transport: exactly-once *parking*. `mailbox.ts` publishes with `link(2)`,
+ *     so a sender retry with the same `dedupeId ?? id` is a `duplicate`, never a
+ *     second copy — even across a sender crash.
+ *   - delivery: at-least-once. The recipient unlinks a message only once it is
+ *     confirmed present in the session transcript (`isPersisted`), so a crash
+ *     between injection and persistence re-delivers rather than drops. A
+ *     per-session dedup ring (`~/.pi/agent/pi-irc-seen/`) suppresses repeats.
  *
- * Exactly-once (two layers, see IRC-DURABLE-SPEC.md):
- *   - transport: a bounded dedup ring keyed by `dedupeId ?? id`, persisted at
- *     `~/.pi/agent/pi-irc-seen/<pane>.seen` — a DURABLE path, not the ephemeral
- *     socket dir (so a socket cleanup or reboot keeps the ring). Delivered
- *     before recorded, so a crash between the two re-delivers on retry rather
- *     than silently losing the message (at-least-once under transport failure).
- *   - admission: a Durable-backed orchestrator passes the envelope id as
- *     `requestId`, so a resubmission is not admitted twice.
- *
- * herdr's roster is the registry: identity is the agent name when set, else the
- * pane id; targets resolve through `agent list`.
- *
- * Ring keying: keys are `dedupeId ?? id`, stored per PANE id and deliberately
- * stable across recipient restarts (that is what makes a Durable-orchestrator
- * retry safe). Consequence: if a pane id is recycled by a new agent, that agent
- * inherits the old ring. Accepted — an old message should not reach a new
- * occupant — so no per-boot nonce is added.
+ * This replaced socket-push delivery, which could lose a message that was queued
+ * in memory when the recipient crashed, and which conflated "rejected" (a
+ * synchronous bounce) with "queued". `mode: "reject"` is gone: a busy recipient
+ * simply defers, which is what a durable mailbox gives you for free.
  */
 
 import { randomUUID } from "node:crypto";
@@ -40,10 +30,12 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { enqueue, listPending, removeMessage, sweepMailboxes } from "./mailbox.ts";
 
 export type IrcScope = "self" | "tab" | "workspace" | "all";
-export type IrcMode = "steer" | "followUp" | "reject";
-export type IrcAckStatus = "accepted" | "queued" | "rejected" | "duplicate";
+/** Delivery mode while the recipient is busy. `reject` is intentionally gone. */
+export type IrcMode = "steer" | "followUp";
+export type IrcAckStatus = "mailboxed" | "duplicate";
 
 export interface IrcEnvelope {
 	id: string;
@@ -63,11 +55,17 @@ export interface IrcEnvelope {
 	expectsReply?: boolean;
 }
 
-/** One JSON line returned by the receiver for every envelope. */
+/** A resolved mailbox destination. `paneId` is only for the doorbell. */
+export interface IrcTarget {
+	mailboxKey: string;
+	paneId?: string;
+	identity?: string;
+}
+
+/** One JSON line returned for an accepted send. */
 export interface IrcAck {
 	ack: IrcAckStatus;
 	id: string;
-	reason?: string;
 }
 
 export interface IrcAgent {
@@ -77,6 +75,7 @@ export interface IrcAgent {
 	agent_status?: string;
 	workspace_id?: string;
 	tab_id?: string;
+	session_id?: string;
 }
 
 export interface IrcPeer {
@@ -90,12 +89,15 @@ export interface IrcPeer {
 }
 
 const LOG_CAP = 200;
-const ACK_TIMEOUT_MS = 5000;
-/** Stale `.seen` files (a pane id that has not sent/received in this long) are reaped. */
+const DOORBELL_TIMEOUT_MS = 2000;
+/** Stale `.seen` files (an identity that has not received in this long) are reaped. */
 const SEEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** Undeliverable mail older than this is reaped. */
+const MAIL_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** Directory holding per-agent sockets. Ephemeral (tmpfs) by design. */
 export function ircDir(): string {
+	if (process.env.PI_IRC_DIR) return process.env.PI_IRC_DIR;
 	const base = process.env.XDG_RUNTIME_DIR || path.join(os.homedir(), ".pi", "agent");
 	return path.join(base, "pi-irc");
 }
@@ -105,7 +107,7 @@ export function ircDir(): string {
  * socket cleanup must cost sockets only, and the ring must survive a reboot.
  */
 export function seenDir(): string {
-	return path.join(os.homedir(), ".pi", "agent", "pi-irc-seen");
+	return process.env.PI_IRC_SEEN_DIR ?? path.join(os.homedir(), ".pi", "agent", "pi-irc-seen");
 }
 
 function sockName(paneId: string): string {
@@ -121,45 +123,32 @@ export function socketPathFor(paneId: string): string {
 	return path.join(ircDir(), sockName(paneId));
 }
 
-function seenPathFor(paneId: string): string {
-	return path.join(seenDir(), `${sockName(paneId)}.seen`);
+function seenPathFor(mailboxKey: string): string {
+	return path.join(seenDir(), `${mailboxKey.replace(/:/g, "~")}.seen`);
 }
 
 /**
- * Write one envelope to a target pane's socket and read its ack.
- * Rejects if the socket is unreachable (stale/dead pane) or no ack arrives.
+ * Ring the doorbell: tell a live pane it has mail. Body-less, best-effort.
+ * Resolves on any response, error, or timeout — a failed doorbell costs
+ * promptness, never delivery.
  */
-export async function sendEnvelope(
-	toPane: string,
-	env: IrcEnvelope,
-	timeoutMs: number = ACK_TIMEOUT_MS,
-): Promise<IrcAck> {
-	const sp = socketPathFor(toPane);
-	return await new Promise<IrcAck>((resolve, reject) => {
+export async function ringDoorbell(paneId: string, timeoutMs: number = DOORBELL_TIMEOUT_MS): Promise<void> {
+	const sp = socketPathFor(paneId);
+	await new Promise<void>((resolve) => {
 		const socket = net.createConnection(sp);
-		let buf = "";
 		let settled = false;
-		const done = (fn: () => void) => {
+		const finish = () => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
 			socket.destroy();
-			fn();
+			resolve();
 		};
-		const timer = setTimeout(() => done(() => reject(new Error(`irc: no ack from ${toPane}`))), timeoutMs);
+		const timer = setTimeout(finish, timeoutMs);
 		timer.unref?.();
-		socket.on("connect", () => socket.write(`${JSON.stringify(env)}\n`));
-		socket.on("data", (d) => {
-			buf += d.toString();
-			const nl = buf.indexOf("\n");
-			if (nl < 0) return;
-			try {
-				done(() => resolve(JSON.parse(buf.slice(0, nl)) as IrcAck));
-			} catch {
-				done(() => reject(new Error(`irc: bad ack from ${toPane}`)));
-			}
-		});
-		socket.on("error", (e) => done(() => reject(new Error(`irc: cannot reach ${toPane}: ${e.message}`))));
+		socket.on("connect", () => socket.write(`${JSON.stringify({ doorbell: true })}\n`));
+		socket.on("data", finish);
+		socket.on("error", finish);
 	});
 }
 
@@ -172,15 +161,20 @@ interface Waiter {
 
 export interface IrcNodeOptions {
 	paneId: string;
+	/** Durable identity. The mailbox is keyed by this when present. */
+	sessionId?: string;
 	identity?: string;
-	/** Inject a message into the live session (steer/followUp decided by caller). */
+	/** Mailbox key; defaults to `sessionId ?? paneId`. */
+	mailboxKey?: string;
+	/** Inject a message into the live session. Fire-and-forget. */
 	deliver: (env: IrcEnvelope) => void;
-	/** Whether the local agent is mid-turn; gates `mode: "reject"`. */
-	isBusy?: () => boolean;
+	/** Whether an injected message is durably in the session. Defaults to "assume yes". */
+	isPersisted?: (env: IrcEnvelope) => boolean;
 }
 
 export class IrcNode {
 	readonly paneId: string;
+	mailboxKey: string;
 	identity: string;
 	private opts: IrcNodeOptions;
 	private server?: net.Server;
@@ -191,10 +185,15 @@ export class IrcNode {
 	/** Bounded, persisted dedup ring of processed `dedupeId ?? id`. */
 	private seen = new Set<string>();
 	private seenOrder: string[] = [];
+	/** Injected but not yet confirmed persisted, keyed by dedupe key. */
+	private injected = new Map<string, IrcEnvelope>();
+	private draining = false;
+	private dirty = false;
 
 	constructor(opts: IrcNodeOptions) {
 		this.opts = opts;
 		this.paneId = opts.paneId;
+		this.mailboxKey = opts.mailboxKey ?? opts.sessionId ?? opts.paneId;
 		this.identity = opts.identity ?? opts.paneId;
 	}
 
@@ -203,13 +202,15 @@ export class IrcNode {
 		await mkdir(ircDir(), { recursive: true });
 		await mkdir(seenDir(), { recursive: true }).catch(() => {});
 		this.sweepSeen();
+		sweepMailboxes(MAIL_TTL_MS);
 		this.loadSeen();
 		await this.listen();
 		this.started = true;
 		// Self-heal: if something unlinks our socket file (an over-broad cleanup,
-		// a manual rm), re-listen so peers can reach us again.
+		// a manual rm), re-listen so peers can still ring us.
 		this.healTimer = setInterval(() => this.healSocket(), 15000);
 		this.healTimer.unref?.();
+		void this.drain();
 	}
 
 	/** (Re)bind the socket. Closes any previous server on the same path. */
@@ -235,6 +236,7 @@ export class IrcNode {
 				this.server?.close();
 				this.server = undefined;
 				await this.listen();
+				void this.drain();
 			} catch {
 				// retry on the next tick
 			}
@@ -255,10 +257,26 @@ export class IrcNode {
 		void unlink(socketPathFor(this.paneId)).catch(() => {});
 	}
 
+	/**
+	 * Bind to the durable session identity: switch the mailbox (and seen ring)
+	 * from the provisional pane key to the session id, then drain. Safe to call
+	 * more than once (a reload re-fires session_start).
+	 */
+	setSession(sessionId: string, identity?: string): void {
+		if (identity) this.identity = identity;
+		if (!sessionId || sessionId === this.mailboxKey) return;
+		this.mailboxKey = sessionId;
+		this.seen = new Set();
+		this.seenOrder = [];
+		this.injected.clear();
+		this.loadSeen();
+		void this.drain();
+	}
+
 	/** Load the persisted ring, keeping only the newest `LOG_CAP` keys. */
 	private loadSeen(): void {
 		try {
-			const lines = readFileSync(seenPathFor(this.paneId), "utf8").split("\n").filter(Boolean);
+			const lines = readFileSync(seenPathFor(this.mailboxKey), "utf8").split("\n").filter(Boolean);
 			const tail = lines.slice(-LOG_CAP);
 			for (const key of tail) {
 				if (!this.seen.has(key)) {
@@ -266,13 +284,13 @@ export class IrcNode {
 					this.seenOrder.push(key);
 				}
 			}
-			writeFileSync(seenPathFor(this.paneId), tail.length ? `${tail.join("\n")}\n` : "");
+			writeFileSync(seenPathFor(this.mailboxKey), tail.length ? `${tail.join("\n")}\n` : "");
 		} catch {
 			// no ring yet
 		}
 	}
 
-	/** Reap `.seen` files for pane ids that have not been active for `SEEN_TTL_MS`. */
+	/** Reap `.seen` files for identities that have not been active for `SEEN_TTL_MS`. */
 	private sweepSeen(): void {
 		try {
 			const now = Date.now();
@@ -297,11 +315,11 @@ export class IrcNode {
 		this.seenOrder.push(key);
 		try {
 			mkdirSync(seenDir(), { recursive: true });
-			appendFileSync(seenPathFor(this.paneId), `${key}\n`);
+			appendFileSync(seenPathFor(this.mailboxKey), `${key}\n`);
 		} catch (error) {
 			// Durable dedup is degrading to in-memory; make that observable.
 			console.error(
-				`[irc] dedup ring write failed for ${this.paneId}; falling back to in-memory only:`,
+				`[irc] dedup ring write failed for ${this.mailboxKey}; falling back to in-memory only:`,
 				error instanceof Error ? error.message : String(error),
 			);
 		}
@@ -310,10 +328,10 @@ export class IrcNode {
 			this.seen = new Set(tail);
 			this.seenOrder = tail;
 			try {
-				writeFileSync(seenPathFor(this.paneId), `${tail.join("\n")}\n`);
+				writeFileSync(seenPathFor(this.mailboxKey), `${tail.join("\n")}\n`);
 			} catch (error) {
 				console.error(
-					`[irc] dedup ring compaction failed for ${this.paneId}:`,
+					`[irc] dedup ring compaction failed for ${this.mailboxKey}:`,
 					error instanceof Error ? error.message : String(error),
 				);
 			}
@@ -324,51 +342,88 @@ export class IrcNode {
 		let buf = "";
 		socket.on("data", (d) => {
 			buf += d.toString();
-			const nl = buf.indexOf("\n");
-			if (nl < 0) return;
-			const line = buf.slice(0, nl);
-			let env: IrcEnvelope;
-			try {
-				env = JSON.parse(line) as IrcEnvelope;
-			} catch {
-				socket.end();
-				return;
-			}
-			if (!env || typeof env.body !== "string" || typeof env.from !== "string") {
-				socket.end();
-				return;
-			}
-			const ack = this.receive(env);
-			socket.write(`${JSON.stringify(ack)}\n`, () => socket.end());
+			if (buf.indexOf("\n") < 0) return;
+			// Any connection is a doorbell: drain and acknowledge.
+			void this.drain();
+			socket.write(`${JSON.stringify({ doorbell: "ok" })}\n`, () => socket.end());
 		});
 		socket.on("error", () => {});
 	}
 
-	/**
-	 * Decide and deliver. At-least-once: deliver FIRST, then record, so a crash
-	 * between the two re-delivers on retry rather than silently losing the
-	 * message. Rejections are never recorded, so a bounced send stays retryable.
-	 */
-	private receive(env: IrcEnvelope): IrcAck {
-		const key = env.dedupeId ?? env.id;
-		if (this.seen.has(key)) return { ack: "duplicate", id: env.id };
+	/** Hand an envelope to a blocked `wait`, if one matches. */
+	private takeWaiter(env: IrcEnvelope): boolean {
 		const i = this.waiters.findIndex((w) => !w.done && (!w.from || w.from === env.from));
-		if (i >= 0) {
-			const w = this.waiters.splice(i, 1)[0]!;
-			w.done = true;
-			clearTimeout(w.timer);
-			w.resolve(env);
-			this.recordSeen(key);
-			return { ack: "accepted", id: env.id };
+		if (i < 0) return false;
+		const w = this.waiters.splice(i, 1)[0]!;
+		w.done = true;
+		clearTimeout(w.timer);
+		w.resolve(env);
+		return true;
+	}
+
+	/** Drain the mailbox: deliver, confirm durability, then unlink. Single-flight. */
+	async drain(): Promise<void> {
+		if (this.draining) {
+			this.dirty = true;
+			return;
 		}
-		if (env.mode === "reject" && (this.opts.isBusy?.() ?? false)) {
-			return { ack: "rejected", id: env.id, reason: "busy" };
+		this.draining = true;
+		try {
+			for (const { key, env } of listPending(this.mailboxKey)) {
+				if (this.seen.has(key)) {
+					removeMessage(this.mailboxKey, key);
+					continue;
+				}
+				if (this.injected.has(key)) {
+					if (this.isPersisted(env)) this.confirm(key, env);
+					continue; // otherwise leave it for `settle()` to confirm or re-arm
+				}
+				if (this.takeWaiter(env)) {
+					this.confirm(key, env);
+					continue;
+				}
+				this.injected.set(key, env);
+				try {
+					this.opts.deliver(env);
+				} catch (error) {
+					this.injected.delete(key);
+					console.error("[irc] delivery failed:", error instanceof Error ? error.message : String(error));
+					continue;
+				}
+				if (this.isPersisted(env)) this.confirm(key, env);
+			}
+		} finally {
+			this.draining = false;
+			if (this.dirty) {
+				this.dirty = false;
+				void this.drain();
+			}
 		}
-		this.opts.deliver(env);
+	}
+
+	private isPersisted(env: IrcEnvelope): boolean {
+		return this.opts.isPersisted ? this.opts.isPersisted(env) : true;
+	}
+
+	private confirm(key: string, env: IrcEnvelope): void {
 		this.recordSeen(key);
+		removeMessage(this.mailboxKey, key);
+		this.injected.delete(key);
 		this.log.push(env);
 		if (this.log.length > LOG_CAP) this.log.shift();
-		return { ack: "queued", id: env.id };
+	}
+
+	/**
+	 * A turn settled: confirm anything queued in memory that made it into the
+	 * transcript; re-arm anything that was dropped (e.g. aborted) so it is
+	 * re-injected, then drain again.
+	 */
+	async settle(): Promise<void> {
+		for (const [key, env] of [...this.injected]) {
+			if (this.isPersisted(env)) this.confirm(key, env);
+			else this.injected.delete(key);
+		}
+		await this.drain();
 	}
 
 	/** Block for the next message (optionally filtered by sender). */
@@ -399,15 +454,19 @@ export class IrcNode {
 		w.resolve(env);
 	}
 
+	/**
+	 * Park an envelope in the recipient's durable mailbox and ring its doorbell.
+	 * Idempotent on `dedupeId ?? id`.
+	 */
 	async send(
-		toPane: string,
+		target: IrcTarget,
 		body: string,
 		opts: { replyTo?: string; mode?: IrcMode; dedupeId?: string; expectsReply?: boolean } = {},
 	): Promise<{ env: IrcEnvelope; ack: IrcAck }> {
 		const env: IrcEnvelope = {
 			id: randomUUID(),
 			from: this.identity,
-			to: toPane,
+			to: target.identity ?? target.mailboxKey,
 			body,
 			ts: Date.now(),
 			...(opts.replyTo ? { replyTo: opts.replyTo } : {}),
@@ -415,11 +474,13 @@ export class IrcNode {
 			...(opts.dedupeId ? { dedupeId: opts.dedupeId } : {}),
 			...(opts.expectsReply === undefined ? {} : { expectsReply: opts.expectsReply }),
 		};
-		const ack = await sendEnvelope(toPane, env);
-		return { env, ack };
+		const result = enqueue(target.mailboxKey, env);
+		if (result === "duplicate") return { env, ack: { ack: "duplicate", id: env.id } };
+		if (target.paneId && target.paneId !== this.paneId) await ringDoorbell(target.paneId);
+		return { env, ack: { ack: "mailboxed", id: env.id } };
 	}
 
-	/** Pane ids with a live IRC listener. */
+	/** Pane ids with a live IRC doorbell listener. */
 	listListeners(): string[] {
 		try {
 			return readdirSync(ircDir())
@@ -443,6 +504,8 @@ export interface IrcToolDeps {
 	node: IrcNode;
 	/** Scoped herdr agents, used to resolve targets and build the roster. */
 	listAgents: (scope: IrcScope) => Promise<IrcAgent[]>;
+	/** Resolve a name / `^^name` / session id / pane id to a mailbox destination. */
+	resolveTarget: (ref: string) => Promise<IrcTarget | undefined>;
 }
 
 const ircScopeSchema = Type.Union(
@@ -450,15 +513,15 @@ const ircScopeSchema = Type.Union(
 	{ description: "send/roster: which agents to include (default workspace)" },
 );
 
-const ircModeSchema = Type.Union([Type.Literal("steer"), Type.Literal("followUp"), Type.Literal("reject")], {
+const ircModeSchema = Type.Union([Type.Literal("steer"), Type.Literal("followUp")], {
 	description:
-		'send: delivery mode. "reject" bounces when the recipient is busy (retry later) instead of interrupting it.',
+		'send: delivery mode while the recipient is busy. "steer" reaches it at its next step; "followUp" queues after the current answer.',
 });
 
 const ircSchema = Type.Object({
 	action: Type.Union([Type.Literal("send"), Type.Literal("wait"), Type.Literal("roster")]),
 	to: Type.Optional(
-		Type.String({ description: 'send: target agent name or pane id, or "all" to broadcast' }),
+		Type.String({ description: 'send: target agent name, session id, or pane id, or "all" to broadcast' }),
 	),
 	body: Type.Optional(Type.String({ description: "send: message text" })),
 	replyTo: Type.Optional(Type.String({ description: "send: id of the message being replied to" })),
@@ -524,12 +587,12 @@ export function registerIrcTool(pi: ExtensionAPI, deps: IrcToolDeps): void {
 		name: "irc",
 		label: "IRC",
 		description:
-			"Agent-to-agent messaging (IRC) between coding agents that run this extension. Each agent listens on its own socket; the herdr roster is the registry. `roster` lists reachable peers, `send` delivers a message to a peer or broadcasts, and `wait` blocks for the next incoming message. Incoming messages are also injected into your session automatically, so you only need `wait` when you want to block for a reply.",
+			"Agent-to-agent messaging (IRC) between coding agents that run this extension. Messages are delivered to a durable per-agent mailbox, so a message to an agent that is not currently running waits until it next runs. `roster` lists reachable peers, `send` parks a message for a peer or broadcasts, and `wait` blocks for the next incoming message. Incoming messages are also injected into your session automatically, so you only need `wait` when you want to block for a reply.",
 		promptSnippet: "Message other agents (IRC) and wait for replies",
 		promptGuidelines: [
 			"Use `irc` to talk to peer agents: `roster` to see who is reachable, `send` to message one (`to: <name|pane>`) or broadcast (`to: \"all\"`), `wait` to block for the next message.",
 			"Incoming IRC messages are injected into your session automatically (steered mid-turn, or a follow-up when idle); a message is delivered exactly once, so `wait` only returns messages you did not already receive.",
-			"`send` returns an ack per target (`accepted`/`queued`/`rejected`/`failed`). Retry only `rejected` (busy recipient) or `failed`, reusing the same `dedupeId` so a retry cannot double-deliver.",
+			"`send` returns an ack per target (`mailboxed`/`duplicate`/`failed`). A `mailboxed` message is already durable, so do not resend it; only `failed` is worth retrying, and reuse the same `dedupeId`.",
 			"Keep messages short and explicit; include what you need and, when replying, set `replyTo` to the incoming message id.",
 			"Reply only when a response is expected; acknowledgements and FYIs need no reply. A reply must not itself demand a reply, or two idle agents will ping-pong.",
 			"When sending, set `expectsReply: true` only if you actually need an answer; leave it unset (or `false`) for FYIs and broadcasts so peers do not reply needlessly.",
@@ -552,56 +615,39 @@ export function registerIrcTool(pi: ExtensionAPI, deps: IrcToolDeps): void {
 					dedupeId: params.dedupeId,
 					expectsReply: params.expectsReply,
 				};
-				const targets: Array<{ pane_id: string; identity: string; workspace_id?: string }> = [];
+				const targets: IrcTarget[] = [];
 				if (!to || to === "all") {
+					const all = await deps.listAgents("all");
 					for (const p of (await peers(scope)).filter((p) => !p.self)) {
-						targets.push({ pane_id: p.pane_id, identity: p.identity, workspace_id: p.workspace_id });
+						const match = all.find((a) => a.pane_id === p.pane_id);
+						const mailboxKey = match?.session_id ?? p.pane_id;
+						targets.push({ mailboxKey, paneId: p.pane_id, identity: p.identity });
 					}
 				} else {
-					const all = await deps.listAgents("all");
-					const match = all.find((a) => a.name === to || a.pane_id === to);
-					if (!match) throw new Error(`irc send: no agent named or at pane "${to}"`);
-					targets.push({
-						pane_id: match.pane_id,
-						identity: match.name ?? match.pane_id,
-						workspace_id: match.workspace_id,
-					});
+					const resolved = await deps.resolveTarget(to);
+					if (!resolved) throw new Error(`irc send: no agent named, at session, or at pane "${to}"`);
+					targets.push(resolved);
 				}
-				const accepted: Array<{ to: string; id: string }> = [];
-				const queued: Array<{ to: string; id: string }> = [];
-				const rejected: Array<{ to: string; id: string; reason?: string }> = [];
+				const mailboxed: Array<{ to: string; id: string }> = [];
 				const duplicate: Array<{ to: string; id: string }> = [];
-				const failed: Array<{
-					to: string;
-					pane_id: string;
-					workspace_id?: string;
-					code: string;
-					error: string;
-				}> = [];
+				const failed: Array<{ to: string; mailboxKey: string; code: string; error: string }> = [];
 				for (const t of targets) {
 					try {
-						const { env, ack } = await node.send(t.pane_id, body, opts);
-						const rec = { to: t.identity, id: env.id };
-						if (ack.ack === "accepted") accepted.push(rec);
-						else if (ack.ack === "queued") queued.push(rec);
-						else if (ack.ack === "rejected") rejected.push({ ...rec, reason: ack.reason });
+						const { env, ack } = await node.send(t, body, opts);
+						const rec = { to: t.identity ?? t.mailboxKey, id: env.id };
+						if (ack.ack === "mailboxed") mailboxed.push(rec);
 						else duplicate.push(rec);
 					} catch (e) {
-						const msg = e instanceof Error ? e.message : String(e);
-						const code = /ECONNREFUSED|ENOENT|no ack|cannot reach/i.test(msg) ? "pane_gone" : "error";
 						failed.push({
-							to: t.identity,
-							pane_id: t.pane_id,
-							...(t.workspace_id ? { workspace_id: t.workspace_id } : {}),
-							code,
-							error: msg,
+							to: t.identity ?? t.mailboxKey,
+							mailboxKey: t.mailboxKey,
+							code: "error",
+							error: e instanceof Error ? e.message : String(e),
 						});
 					}
 				}
 				const out = {
-					accepted,
-					queued,
-					...(rejected.length ? { rejected } : {}),
+					mailboxed,
 					...(duplicate.length ? { duplicate } : {}),
 					...(failed.length ? { failed } : {}),
 				};
