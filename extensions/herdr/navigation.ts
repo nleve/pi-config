@@ -43,7 +43,7 @@ export function appendSpawnEntry(pi: ExtensionAPI, entry: SpawnEntry): void {
 }
 
 /** Validate one branch entry's data. Unknown/malformed data is ignored. */
-function parseSpawnEntry(data: unknown): SpawnEntry | undefined {
+export function parseSpawnEntry(data: unknown): SpawnEntry | undefined {
 	if (!data || typeof data !== "object") return undefined;
 	const rec = data as Record<string, unknown>;
 	if (rec.action !== "spawn" && rec.action !== "agent_start") return undefined;
@@ -121,6 +121,47 @@ function groupStage(entry: SpawnEntry): string | undefined {
 	return entry.group ?? entry.stage;
 }
 
+/**
+ * Live agent pane ids/names from a single `herdr agent list`, or undefined when
+ * the call fails. `agent list` is the authoritative liveness signal; the pid in
+ * the registry cannot tell a reused pid from a still-running worker.
+ */
+async function fetchLiveAgents(): Promise<{ panes: Set<string>; names: Set<string> } | undefined> {
+	try {
+		const { result } = await callHerdr({ args: ["agent", "list"], timeoutMs: 30000 });
+		const rec = asRecord(result);
+		const raw = Array.isArray(rec?.agents) ? (rec.agents as Record<string, unknown>[]) : [];
+		const panes = new Set<string>();
+		const names = new Set<string>();
+		for (const agent of raw) {
+			const pane = asString(agent.pane_id);
+			if (pane) panes.add(pane);
+			const name = asString(agent.name);
+			if (name) names.add(name);
+		}
+		return { panes, names };
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * This session's own registry identity. The parent link is written to the
+ * registry file by the spawning orchestrator, not to this session's branch, so
+ * resolve it from `readIdentities()`: session id first, then pane id, folding
+ * duplicate records through `preferIdentity`.
+ */
+function ownIdentity(ctx: ExtensionContext, identities: readonly AgentIdentity[]): AgentIdentity | undefined {
+	const sessionId = ctx.sessionManager.getSessionId();
+	const pane = process.env.HERDR_PANE_ID;
+	let best: AgentIdentity | undefined;
+	for (const id of identities) {
+		if (sessionId && id.session_id === sessionId) best = preferIdentity(best, id, sessionId);
+		else if (pane && id.pane_id === pane) best = preferIdentity(best, id, sessionId);
+	}
+	return best;
+}
+
 interface PickerItem {
 	label: string;
 	entry: SpawnEntry;
@@ -170,8 +211,24 @@ export function registerNavigation(pi: ExtensionAPI): void {
 		await callHerdr({ args: ["workspace", "focus", workspace], timeoutMs: 10000 });
 	}
 
+	/** Poll `herdr agent list` until `pane` appears, or the deadline passes. */
+	async function waitForAgent(pane: string, timeoutMs: number): Promise<boolean> {
+		const deadline = Date.now() + timeoutMs;
+		for (;;) {
+			const live = await fetchLiveAgents();
+			if (live?.panes.has(pane)) return true;
+			if (Date.now() >= deadline) return false;
+			await new Promise((resolve) => setTimeout(resolve, 500));
+		}
+	}
+
 	/** Resume a closed worker in a fresh pane split from the caller's pane. */
 	async function resumeClosed(ctx: ExtensionContext, entry: SpawnEntry): Promise<void> {
+		// A bare `pi --resume` picks the most recent session, which may belong to a
+		// different worker: never resume without the recorded transcript.
+		if (!entry.session_path) {
+			throw new Error(`cannot resume ${entry.name}: no session path recorded`);
+		}
 		const callerPane = process.env.HERDR_PANE_ID;
 		if (!callerPane) throw new Error("HERDR_PANE_ID is not set; cannot split a pane");
 		const args = ["pane", "split", "--pane", callerPane, "--direction", "down"];
@@ -181,12 +238,18 @@ export function registerNavigation(pi: ExtensionAPI): void {
 		const newPane = asString(pane?.pane_id);
 		const tabId = asString(pane?.tab_id);
 		if (!newPane) throw new Error("pane split returned no pane id");
-		const command = entry.session_path
-			? `pi --session ${shellQuote(entry.session_path)}`
-			: "pi --resume";
+		const command = `pi --session ${shellQuote(entry.session_path)}`;
 		await callHerdr({ args: ["pane", "run", newPane, command], timeoutMs: 30000 });
+		// `pane run` only types the command and presses Enter, so confirm pi
+		// actually came up before recording the pane. Otherwise a silent failure
+		// would leak the split and append a ledger entry that splits yet another
+		// pane on the next retry.
+		if (!(await waitForAgent(newPane, 15000))) {
+			await callHerdr({ args: ["pane", "close", newPane], timeoutMs: 10000 }).catch(() => {});
+			throw new Error(`resumed ${entry.name} did not start in ${newPane}; closed the pane`);
+		}
 		if (tabId) await callHerdr({ args: ["tab", "focus", tabId], timeoutMs: 10000 }).catch(() => {});
-		// Record the new pane so the next visit finds it live.
+		// Record the new pane only now that the resume is verified.
 		appendSpawnEntry(pi, { ...entry, pane_id: newPane, ts: Date.now() });
 	}
 
@@ -203,9 +266,16 @@ export function registerNavigation(pi: ExtensionAPI): void {
 			return;
 		}
 		const identities = readIdentities();
+		const liveAgents = await fetchLiveAgents();
 		const items: PickerItem[] = entries.map((entry) => {
 			const identity = resolveIdentity(entry, identities);
-			const live = identity ? isAlive(identity.pid) : false;
+			const pane = identity?.pane_id ?? entry.pane_id;
+			// Prefer the live roster; only trust the pid when `agent list` failed.
+			const live = liveAgents
+				? (pane !== undefined && liveAgents.panes.has(pane)) || liveAgents.names.has(entry.name)
+				: identity
+					? isAlive(identity.pid)
+					: false;
 			const meta = [groupStage(entry), entry.model].filter(Boolean).join("  ");
 			const label = `${live ? "●" : "○"} ${entry.name}${meta ? `  ${meta}` : ""}  ${live ? "live" : "closed"}`;
 			return { label, entry, identity, live };
@@ -220,8 +290,17 @@ export function registerNavigation(pi: ExtensionAPI): void {
 		const item = byLabel.get(choice);
 		if (!item) return;
 		try {
-			if (item.live) await focusLive(item);
-			else await resumeClosed(ctx, item.entry);
+			if (item.live) {
+				try {
+					await focusLive(item);
+				} catch {
+					// Liveness can be stale (recycled pid); a failed focus means the
+					// worker is really gone, so offer the resume path instead.
+					await resumeClosed(ctx, item.entry);
+				}
+			} else {
+				await resumeClosed(ctx, item.entry);
+			}
 		} catch (error) {
 			notifyError(ctx, error);
 		}
@@ -230,17 +309,28 @@ export function registerNavigation(pi: ExtensionAPI): void {
 	/** `/parent`: focus the session that spawned this one, when recorded. */
 	async function focusParent(ctx: ExtensionContext): Promise<void> {
 		if (!herdrReady(ctx)) return;
-		const sessionId = ctx.sessionManager.getSessionId();
-		const pane = process.env.HERDR_PANE_ID;
-		const own = readSpawnEntries(ctx).find(
-			(entry) => (sessionId && entry.session_id === sessionId) || (pane && entry.pane_id === pane),
-		);
-		if (!own || (!own.parent_name && !own.parent_pane_id)) {
+		// The parent link lives on this session's registry identity (stamped by
+		// the orchestrator), not in this session's own spawn ledger.
+		const identities = readIdentities();
+		const own = ownIdentity(ctx, identities);
+		if (!own || (!own.parent_name && !own.parent_pane_id && !own.parent_session_id)) {
 			ctx.ui.notify("this session has no recorded parent", "info");
 			return;
 		}
-		for (const target of [own.parent_name, own.parent_pane_id]) {
-			if (!target) continue;
+		const targets: string[] = [];
+		if (own.parent_name) targets.push(own.parent_name);
+		if (own.parent_pane_id) targets.push(own.parent_pane_id);
+		if (targets.length === 0 && own.parent_session_id) {
+			// Only the durable session id was stamped; resolve it to a live handle.
+			const parent = findIdentity(own.parent_session_id, identities);
+			if (parent?.name) targets.push(parent.name);
+			if (parent?.pane_id) targets.push(parent.pane_id);
+		}
+		if (targets.length === 0) {
+			ctx.ui.notify("herdr: parent session is recorded but not registered", "warning");
+			return;
+		}
+		for (const target of targets) {
 			try {
 				await callHerdr({ args: ["agent", "focus", target], timeoutMs: 10000 });
 				return;
