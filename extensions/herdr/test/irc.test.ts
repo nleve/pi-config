@@ -7,10 +7,11 @@
  * and rendering.
  */
 import { existsSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { messagePath } from "../mailbox.ts";
-import { formatIrcForModel, IrcNode, ircDir, seenDir } from "../irc.ts";
+import { broadcastTargets, formatIrcForModel, IrcNode, ircDir, seenDir, socketPathFor } from "../irc.ts";
 
 let failures = 0;
 function check(name: string, cond: boolean, detail = "") {
@@ -48,8 +49,14 @@ check("delivered -> unlinked", !existsSync(messagePath("sessB", "d1")));
 const bobParked = { mailboxKey: "sessB", identity: "bob" };
 r = await A.send(bobParked, "parked", { dedupeId: "d7" });
 check("first park -> mailboxed", r.ack.ack === "mailboxed", r.ack.ack);
+const parkedId = r.env.id;
 r = await A.send(bobParked, "parked", { dedupeId: "d7" });
 check("retry while parked -> duplicate", r.ack.ack === "duplicate", r.ack.ack);
+check(
+	"duplicate reports the already-parked id",
+	r.ack.id === parkedId && r.env.id === parkedId,
+	`${r.ack.id} vs ${parkedId}`,
+);
 await B.drain();
 
 // after delivery the file is gone, so a late retry re-parks; the recipient's
@@ -142,6 +149,69 @@ const E = new IrcNode({ paneId: "tst:pE", sessionId: "sessE", identity: "erin", 
 await E.start();
 check("stale ring reaped on start", !existsSync(staleRing));
 E.stop();
+
+// broadcast is not workspace-scoped: it unions live peers with durable registry
+// identities, so other-workspace live agents and dormant agents (no live pane)
+// are not silently skipped, while the sender is
+const bt = broadcastTargets(
+	[
+		{ pane_id: "tst:pB", identity: "bob", mailboxKey: "sessB" },
+		{ pane_id: "tst:pA", identity: "alice", self: true },
+	],
+	[
+		{ pane_id: "tst:pB", name: "bob", session_id: "sessB", pid: process.pid },
+		{ pane_id: "w9:pZ", name: "zoe", session_id: "sessZ", pid: 0 },
+		{ pane_id: "tst:pA", name: "alice", session_id: "sessA", pid: process.pid },
+	],
+	"tst:pA",
+);
+check(
+	"broadcast unions live + dormant, skips self",
+	bt.map((t) => t.mailboxKey).join(",") === "sessB,sessZ",
+	JSON.stringify(bt),
+);
+check("live durable keeps its pane for the doorbell", bt[0]?.paneId === "tst:pB");
+check("dormant durable is mailbox-only", bt[1]?.paneId === undefined && bt[1]?.identity === "zoe");
+
+// a duplicate retry must still ring the doorbell (a live recipient is re-nudged)
+const fakePane = "tst:pFake";
+let doorbells = 0;
+const fakeServer = net.createServer((s) => {
+	doorbells++;
+	s.write("ok\n", () => s.end());
+});
+await new Promise<void>((resolve) => fakeServer.listen(socketPathFor(fakePane), resolve));
+const fake = { mailboxKey: "fakeSess", paneId: fakePane, identity: "fake" };
+const f1 = await A.send(fake, "nudge", { dedupeId: "df1" });
+const f2 = await A.send(fake, "nudge", { dedupeId: "df1" });
+check("duplicate retry re-nudges the doorbell", doorbells === 2, String(doorbells));
+check("duplicate retry keeps the parked id", f2.env.id === f1.env.id && f2.ack.id === f1.env.id);
+await new Promise<void>((resolve) => fakeServer.close(() => resolve()));
+
+// a session switch must not orphan unconfirmed pane-keyed mail: it is reattached
+// to the durable session mailbox before the key flips
+let xPersisted = false;
+const xInbox: string[] = [];
+const X = new IrcNode({
+	paneId: "tst:pX",
+	identity: "xavier",
+	deliver: (e) => xInbox.push(e.body),
+	isPersisted: () => xPersisted,
+});
+await X.start();
+await A.send({ mailboxKey: "tst:pX", identity: "xavier" }, "pane-keyed", { dedupeId: "dx1" });
+check("pane-keyed mail parked before switch", existsSync(messagePath("tst:pX", "dx1")));
+X.setSession("sessX", "xavier");
+// setSession auto-drains; unconfirmed, so it stays in the session mailbox
+check(
+	"pane-keyed mail reattached to session",
+	existsSync(messagePath("sessX", "dx1")) && !existsSync(messagePath("tst:pX", "dx1")),
+);
+check("reattached mail delivered", xInbox.includes("pane-keyed"), xInbox.join(","));
+xPersisted = true;
+await X.settle();
+check("reattached mail confirmed once", !existsSync(messagePath("sessX", "dx1")) && xInbox.length === 1);
+X.stop();
 
 // incoming rendering must never demand a reply (omp's anti-ping-pong model)
 const msg = { id: "m1", from: "bob", to: "alice", body: "ping", ts: 0 };

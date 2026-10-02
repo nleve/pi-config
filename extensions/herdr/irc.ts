@@ -30,7 +30,8 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { enqueue, listPending, removeMessage, sweepMailboxes } from "./mailbox.ts";
+import { enqueue, envelopeKey, listPending, removeMessage, sweepMailboxes } from "./mailbox.ts";
+import { isAlive, readIdentities } from "./registry.ts";
 
 export type IrcScope = "self" | "tab" | "workspace" | "all";
 /** Delivery mode while the recipient is busy. `reject` is intentionally gone. */
@@ -81,11 +82,54 @@ export interface IrcAgent {
 export interface IrcPeer {
 	pane_id: string;
 	identity: string;
+	/** Durable mailbox key (session id when known); defaults to the pane id. */
+	mailboxKey?: string;
 	name?: string;
 	agent?: string;
 	status?: string;
 	workspace_id?: string;
 	self?: boolean;
+}
+
+/** A durable registry identity, structurally compatible with `AgentIdentity`. */
+export interface IrcDurableIdentity {
+	pane_id: string;
+	name?: string;
+	session_id?: string;
+	pid?: number;
+}
+
+/**
+ * Broadcast recipient set: live peers (already scoped) unioned with durable
+ * registry identities. A dormant identity (pid gone) has no live pane, so it
+ * becomes a mailbox-only target; a live one keeps its pane for the doorbell.
+ * The sender is skipped and targets are de-duplicated by mailbox key.
+ */
+export function broadcastTargets(
+	peers: readonly IrcPeer[],
+	durable: readonly IrcDurableIdentity[],
+	selfPane: string,
+): IrcTarget[] {
+	const out: IrcTarget[] = [];
+	const seen = new Set<string>();
+	const add = (target: IrcTarget) => {
+		if (!target.mailboxKey || target.paneId === selfPane || seen.has(target.mailboxKey)) return;
+		seen.add(target.mailboxKey);
+		out.push(target);
+	};
+	for (const p of peers) {
+		if (p.self || p.pane_id === selfPane) continue;
+		add({ mailboxKey: p.mailboxKey ?? p.pane_id, paneId: p.pane_id, identity: p.identity });
+	}
+	for (const d of durable) {
+		if (d.pane_id === selfPane) continue;
+		add({
+			mailboxKey: d.session_id ?? d.pane_id,
+			...(d.pid !== undefined && isAlive(d.pid) ? { paneId: d.pane_id } : {}),
+			identity: d.name ?? d.pane_id,
+		});
+	}
+	return out;
 }
 
 const LOG_CAP = 200;
@@ -265,12 +309,32 @@ export class IrcNode {
 	setSession(sessionId: string, identity?: string): void {
 		if (identity) this.identity = identity;
 		if (!sessionId || sessionId === this.mailboxKey) return;
+		// The mailbox key changes from the provisional pane id to the durable
+		// session id. Reattach anything still parked under the old key first, or
+		// unconfirmed pane-keyed mail would be orphaned forever.
+		this.reattachMail(this.mailboxKey, sessionId);
 		this.mailboxKey = sessionId;
 		this.seen = new Set();
 		this.seenOrder = [];
 		this.injected.clear();
 		this.loadSeen();
 		void this.drain();
+	}
+
+	/**
+	 * Move pending mail from the provisional pane key to the durable session key
+	 * on a `setSession` switch. The idempotency key is preserved, so a message
+	 * already present in the destination is not copied twice.
+	 */
+	private reattachMail(fromKey: string, toKey: string): void {
+		for (const { env } of listPending(fromKey)) {
+			try {
+				enqueue(toKey, env);
+				removeMessage(fromKey, envelopeKey(env));
+			} catch (error) {
+				console.error("[irc] mailbox reattach failed:", error instanceof Error ? error.message : String(error));
+			}
+		}
 	}
 
 	/** Load the persisted ring, keeping only the newest `LOG_CAP` keys. */
@@ -475,8 +539,15 @@ export class IrcNode {
 			...(opts.expectsReply === undefined ? {} : { expectsReply: opts.expectsReply }),
 		};
 		const result = enqueue(target.mailboxKey, env);
-		if (result === "duplicate") return { env, ack: { ack: "duplicate", id: env.id } };
+		// Ring before the duplicate early-return: a retry must still nudge a live
+		// recipient, and the ack must name the already-parked envelope, not this
+		// fresh id.
 		if (target.paneId && target.paneId !== this.paneId) await ringDoorbell(target.paneId);
+		if (result === "duplicate") {
+			const parked = listPending(target.mailboxKey).find((i) => i.key === envelopeKey(env));
+			const existing = parked?.env ?? env;
+			return { env: existing, ack: { ack: "duplicate", id: existing.id } };
+		}
 		return { env, ack: { ack: "mailboxed", id: env.id } };
 	}
 
@@ -570,6 +641,7 @@ export function registerIrcTool(pi: ExtensionAPI, deps: IrcToolDeps): void {
 			out.push({
 				pane_id: a.pane_id,
 				identity: a.name ?? a.pane_id,
+				mailboxKey: a.session_id ?? a.pane_id,
 				name: a.name,
 				agent: a.agent,
 				status: a.agent_status,
@@ -617,12 +689,10 @@ export function registerIrcTool(pi: ExtensionAPI, deps: IrcToolDeps): void {
 				};
 				const targets: IrcTarget[] = [];
 				if (!to || to === "all") {
-					const all = await deps.listAgents("all");
-					for (const p of (await peers(scope)).filter((p) => !p.self)) {
-						const match = all.find((a) => a.pane_id === p.pane_id);
-						const mailboxKey = match?.session_id ?? p.pane_id;
-						targets.push({ mailboxKey, paneId: p.pane_id, identity: p.identity });
-					}
+					// Broadcast is not workspace-scoped: force scope "all" and union live
+					// peers with the durable registry, so other workspaces and dormant
+					// (no live pane) identities get a mailbox-only target too.
+					targets.push(...broadcastTargets(await peers("all"), readIdentities(), node.paneId));
 				} else {
 					const resolved = await deps.resolveTarget(to);
 					if (!resolved) throw new Error(`irc send: no agent named, at session, or at pane "${to}"`);
