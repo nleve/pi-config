@@ -1,7 +1,14 @@
-# snapcompact (pi extension)
+# Compaction (Pi extension)
 
-A pi port of [omp's `@oh-my-pi/snapcompact`](https://github.com/can1357/oh-my-pi): bitmap-frame
-context compaction, plus opt-in inline imaging of large tool results.
+One compaction hook runs **Codex Remote V2 → Snapcompact → soft** by default.
+Unsupported methods are skipped; cancellation stops the chain. Remote V2 is only
+attempted for `openai-codex` models on the official ChatGPT endpoint. Other models
+start with Snapcompact and use soft if images are unsupported or the archive is declined.
+The extension lives in `extensions/compaction/`; existing Snapcompact settings and archives
+keep their original paths.
+
+Snapcompact is a Pi port of [OMP's `@oh-my-pi/snapcompact`](https://github.com/can1357/oh-my-pi),
+with opt-in inline imaging of large tool results.
 
 Instead of asking an LLM to summarize the history being discarded, snapcompact serializes it,
 normalizes it, and rasterizes it into dense PNG frames of pixel-font text. A vision model reads
@@ -9,10 +16,11 @@ those frames back directly on later turns. The pass is local and deterministic �
 API key, no latency beyond rendering (tens of ms).
 
 ```
-/compact              → method picker (default selection: Snapcompact)
-/compact soft [focus] → classic LLM summary ("soft" compaction)
-/compact snapcompact  → bitmap-frame archive (rejects focus text)
-/compaction           → configure method, shape, frames, tool-result imaging, blobs, GC
+/compact              → method picker (first choice: configured fallback chain)
+/compact remote       → Codex Remote V2, then Snapcompact, then soft
+/compact snap         → Snapcompact, then soft
+/compact soft [focus] → Pi text summary only
+/compaction           → configure fallback order, shape, frames, tool-result imaging, blobs, GC
 /snapcompact-gc       → collect unreferenced frame blobs now
 ```
 
@@ -36,14 +44,15 @@ omp's native integration because they change behavior, not just plumbing:
 | Content-addressed frame store | `blobs.ts` | omp's `blob:sha256:` externalization; the engine resolves it via `historyBlocks`'s `resolveFrameData`. |
 
 Intentionally **not** ported: system-prompt/context-file imaging (cache-hostile, off in omp too),
-the `remote`/`handoff`/`shake` method chain, the savings journal, stale-archive rescue, and the
-`unknown → 5` provider floor as a hard cap.
+the OMP `handoff` and `shake` methods, the savings journal, stale-archive rescue,
+and the `unknown → 5` provider floor as a hard cap.
 
 ## How it plugs into pi
 
 | pi hook | what it does |
 | --- | --- |
-| `session_before_compact` | Sizes the archive against the model window, runs snapcompact over `messagesToSummarize` + `turnPrefixMessages`, validates the standing image payload, applies the reduction guard, externalizes frame bytes to the blob store, and returns the compaction. |
+| `session_before_compact` | Runs the configured methods in order and commits only the first success. Snapcompact applies its window, reduction and payload guards. |
+| `before_provider_request` | Replaces the portable summary with a saved Codex checkpoint only for the issuing model and account on the official Codex endpoint. |
 | `context` | Re-attaches the active archive's frames, optionally images large historical tool results, and keeps the total image count within the provider budget. |
 
 Frames persist in the compaction entry's `details` as `blob:sha256:` references (or inline base64
@@ -63,6 +72,19 @@ references and deletes only blobs that are **both unreferenced and older than 30
 inside a 5-minute write grace). A blob whose mtime moves mid-sweep is kept, so a `put` racing the
 sweep can't lose data. A missing blob degrades to a dropped frame rather than corrupt image input.
 
+## Remote checkpoints and recovery
+
+Remote V2 uses the official ChatGPT Codex Responses endpoint and Pi's configured OAuth.
+It compacts the prefix selected by Pi, leaves the recent tail verbatim, and stores the
+returned opaque checkpoint in the session JSONL. It does not generate a second LLM summary.
+A bounded readable excerpt is saved alongside the checkpoint for other models or when replay
+is unavailable. The original transcript stays on disk.
+
+If a later remote attempt fails, the extension reconstructs the readable prefix from the
+active branch, respecting context edits and the previous portable compaction. Snapcompact
+and soft use that prefix rather than summarizing only the tail. If no method succeeds, the
+existing checkpoint and transcript are left unchanged.
+
 ## The `soft` fallback
 
 If the model cannot accept images, the archive would not reduce context, the payload would exceed
@@ -72,11 +94,11 @@ token-neutral, so an archive that does not pay is worse than a summary that does
 
 ## Install
 
-The directory is already a pi extension — pi discovers `~/.pi/agent/extensions/snapcompact/`.
+Pi discovers `~/.pi/agent/extensions/compaction/` automatically.
 Reload with `/reload`, or pass it explicitly:
 
 ```bash
-pi -e ~/.pi/agent/extensions/snapcompact/index.ts
+pi -e ~/.pi/agent/extensions/compaction/index.ts
 ```
 
 ## The native renderer
@@ -102,7 +124,7 @@ If the addon can't be found, `/compact` falls back to soft compaction with a war
 
 ```json
 {
-  "default": "snapcompact",
+  "methodOrder": ["remote", "snapcompact", "soft"],
   "picker": true,
   "maxFrames": 40,
   "shape": "auto",
@@ -112,7 +134,9 @@ If the addon can't be found, `/compact` falls back to soft compaction with a war
 }
 ```
 
-- `default` — method for bare `/compact` when `picker` is off, and for automatic compaction.
+- `methodOrder` — methods to try in order, for automatic compaction and the picker's Auto option.
+  A legacy `"default": "snapcompact"` uses the new chain; a legacy explicit `"default": "soft"`
+  stays soft-only. The remaining settings and saved archives are unchanged.
 - `picker` — show a method picker on bare `/compact`.
 - `maxFrames` — upper limit; the effective cap is lowered by the window budget, the 3 MB data
   budget, and the provider image budget.
@@ -125,7 +149,10 @@ If the addon can't be found, `/compact` falls back to soft compaction with a war
 ## Repo layout
 
 ```
-index.ts                 extension glue (hooks, picker, /compaction, config)
+index.ts                 method selection and fallback hook; Snapcompact rendering
+chain.ts                 readable branch projection and Pi text summarization
+remote.ts                Codex Remote V2 request, checkpoint, and compatible replay
+vendor/codex/            V2 protocol helpers from Criogaid (MIT)
 budget.ts                window sizing + reduction guard
 tuning.ts                provider image budgets / api family mapping
 inline.ts                tool-result imaging (savings gate, cache)
@@ -151,8 +178,9 @@ vendor/pi-ai-types.ts    minimal type stand-ins (erased at runtime)
 - **Prompt caching.** Re-attached archive images and imaged tool results are deterministic, so they
   are cache-stable once rendered; the first request that crosses a threshold pays a cache miss.
   System-prompt imaging — the cache-hostile variant — is not implemented.
-- **`/compact soft <focus>`.** pi reads `customInstructions` before the extension sees them, so a
-  stripped `soft` token cannot be removed from focus text passed to the summarizer. Harmless.
+- **Portable checkpoint view.** A different Codex model, account, or provider gets a bounded
+  excerpt, not the full history or the opaque item. A later portable compact rebuilds its
+  input from the saved branch.
 - **OpenAI `detail`.** Pi 1.5.2 sends `auto` rather than forwarding the engine's `imageDetail`.
   OMP's pricing and legibility estimates for `original` image detail do not directly carry over.
 
@@ -160,3 +188,5 @@ vendor/pi-ai-types.ts    minimal type stand-ins (erased at runtime)
 
 `vendor/snapcompact.ts` and the vendored pi-utils files are MIT-licensed work of Stencil Labs, Inc.
 (`@oh-my-pi/*`). See upstream `THIRD-PARTY-NOTICES.txt` in the omp packages.
+The V2 wire helpers are from [Criogaid's Pi extension](https://github.com/Criogaid/pi-codex-compaction)
+0.5.2; see `vendor/codex/LICENSE`.

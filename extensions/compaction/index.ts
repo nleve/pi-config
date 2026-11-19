@@ -1,5 +1,5 @@
 /**
- * Snapcompact — bitmap-frame context compaction for pi.
+ * Compaction for Pi — Codex Remote V2, Snapcompact, and Pi text summaries.
  *
  * A port of omp's snapcompact (`@oh-my-pi/snapcompact`) as a pi extension.
  * Instead of asking an LLM to summarize discarded history, the discarded turns
@@ -18,24 +18,30 @@
  *     large historical tool results (inline imaging), and keeps the total image
  *     count within the provider's per-request budget.
  *
- * `/compact` presents a method picker by default and uses `snapcompact` as the
- * default selection. The classic LLM summary is called `soft` compaction:
- *   /compact                    → picker (or the configured default)
+ * Automatic compaction defaults to remote → snapcompact → soft.
+ * `/compact` offers the chain and individual starting methods:
+ *   /compact                    → picker (or the configured chain)
+ *   /compact remote             → try Codex V2 first
+ *   /compact snapcompact        → try the bitmap archive first
  *   /compact soft [focus]       → classic LLM summary
- *   /compact snapcompact        → bitmap-frame archive (rejects focus text)
- *   /compaction                 → configure all of the above
+ *   /compaction                 → configure ordering and archive settings
  *
  * Config lives at ~/.pi/agent/snapcompact.json (created on first use).
  */
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
+	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
 } from "@earendil-works/pi-coding-agent";
-import { convertToLlm } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+	compactReadable, DEFAULT_ORDER, methodOrder, projectPrefix, readableBranch, readableSummary, recoveredEvent, remotePortableSummary,
+	type Method,
+} from "./chain.ts";
+import { checkpointEdited, isRemoteEntry, registerRemoteReplay, remoteCompact, supportsRemote } from "./remote.ts";
 import {
 	compact as runSnapcompact,
 	FRAME_DATA_BYTES_BUDGET,
@@ -63,13 +69,13 @@ const COMPACTION_SUMMARY_PREFIX =
 	"The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 const COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
 
+const CHAIN_LABEL = "Auto — use the configured fallback order";
+const REMOTE_LABEL = "Remote — try Codex V2 first, then fall back";
 const SNAP_LABEL = "Snapcompact — archive history onto bitmap images (no LLM call)";
 const SOFT_LABEL = "Soft — summarize with the active model";
 
-type Method = "snapcompact" | "soft";
-
 interface Config {
-	default: Method;
+	methodOrder: Method[];
 	picker: boolean;
 	/** Upper limit; the effective cap is lowered by the model window/budget. */
 	maxFrames: number;
@@ -83,20 +89,20 @@ interface Config {
 }
 
 const DEFAULT_CONFIG: Config = {
-	default: "snapcompact",
+	methodOrder: [...DEFAULT_ORDER],
 	picker: true,
 	maxFrames: 80,
 	shape: "auto",
 	toolResults: false,
 	blobStore: true,
 };
-const CONFIG_PATH = path.join(os.homedir(), ".pi", "agent", "snapcompact.json");
+const CONFIG_PATH = path.join(getAgentDir(), "snapcompact.json");
 
 function loadConfig(): Config {
 	try {
-		const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) as Partial<Config>;
+		const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) as Partial<Config> & { default?: string };
 		return {
-			default: parsed.default === "soft" ? "soft" : "snapcompact",
+			methodOrder: methodOrder(parsed.methodOrder) ?? (parsed.default === "soft" ? ["soft"] : [...DEFAULT_ORDER]),
 			picker: parsed.picker !== false,
 			maxFrames:
 				typeof parsed.maxFrames === "number" && parsed.maxFrames > 0
@@ -149,6 +155,9 @@ function parseInstructions(raw: string | undefined): ParsedInstructions {
 	const token = (spaceIndex === -1 ? trimmed : trimmed.slice(0, spaceIndex)).toLowerCase();
 	const rest = spaceIndex === -1 ? "" : trimmed.slice(spaceIndex + 1).trim();
 
+	if (token === "remote") {
+		return rest ? { error: "Remote compaction does not accept focus instructions; use /compact soft <focus>." } : { method: "remote" };
+	}
 	if (token === "snapcompact" || token === "snap" || token === "sc") {
 		return rest
 			? { error: "snapcompact archives history without an LLM summary, so it ignores focus instructions." }
@@ -289,7 +298,11 @@ function archiveBlocks(archive: Archive) {
 	);
 }
 
-export default function snapcompactExtension(pi: ExtensionAPI): void {
+export default function compactionExtension(pi: ExtensionAPI): void {
+	registerCompaction(pi);
+}
+
+export function registerCompaction(pi: ExtensionAPI, options: { remoteFetch?: typeof globalThis.fetch } = {}): void {
 	// Keep one decoded frame payload, keyed by session, compaction and limit.
 	let archiveCache: { key: string; blocks: ReturnType<typeof archiveBlocks> } | undefined;
 	// Rendered inline tool-result frames, keyed by toolCallId.
@@ -300,31 +313,7 @@ export default function snapcompactExtension(pi: ExtensionAPI): void {
 		void maybeAutoGc(gcScopeFor(ctx)).catch(() => {});
 	});
 
-	pi.on("session_before_compact", async (event, ctx): Promise<SessionBeforeCompactResult | undefined> => {
-		const config = loadConfig();
-		const parsed = parseInstructions(event.customInstructions);
-		if (parsed.error) {
-			ctx.ui.notify(parsed.error, "error");
-			return { cancel: true };
-		}
-
-		let method = parsed.method;
-		if (!method) {
-			if (event.reason === "manual" && config.picker && ctx.hasUI) {
-				const options = config.default === "snapcompact" ? [SNAP_LABEL, SOFT_LABEL] : [SOFT_LABEL, SNAP_LABEL];
-				const choice = await ctx.ui.select("Compaction method", options);
-				if (choice === undefined) return { cancel: true };
-				method = choice === SNAP_LABEL ? "snapcompact" : "soft";
-			} else {
-				method = config.default;
-			}
-		}
-
-		if (method === "soft") {
-			// Hand off to pi's built-in "soft" (LLM summary) compaction.
-			return undefined;
-		}
-
+	async function snapcompact(event: SessionBeforeCompactEvent, ctx: ExtensionContext, config: Config): Promise<SessionBeforeCompactResult | undefined> {
 		if (!modelSupportsImages(ctx)) {
 			ctx.ui.notify("Snapcompact needs a model that accepts images; falling back to soft compaction.", "warning");
 			return undefined;
@@ -442,6 +431,73 @@ export default function snapcompactExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(`Snapcompact failed (${message}); falling back to soft compaction.`, "warning");
 			return undefined;
 		}
+	}
+
+	registerRemoteReplay(pi);
+	pi.on("session_before_compact", async (event, ctx): Promise<SessionBeforeCompactResult | undefined> => {
+		const config = loadConfig();
+		const parsed = parseInstructions(event.customInstructions);
+		if (parsed.error) {
+			ctx.ui.notify(parsed.error, "error");
+			return { cancel: true };
+		}
+		let method = parsed.method;
+		if (!method && !parsed.focus && event.reason === "manual" && config.picker && ctx.hasUI) {
+			const choices = [CHAIN_LABEL, ...(supportsRemote(ctx.model) ? [REMOTE_LABEL] : []), SNAP_LABEL, SOFT_LABEL];
+			const choice = await ctx.ui.select("Compaction method", choices);
+			if (choice === undefined) return { cancel: true };
+			method = choice === REMOTE_LABEL ? "remote" : choice === SNAP_LABEL ? "snapcompact" : choice === SOFT_LABEL ? "soft" : undefined;
+		}
+		const order = method === "remote" ? DEFAULT_ORDER : method === "snapcompact" ? ["snapcompact", "soft"] as const :
+			method === "soft" || parsed.focus ? ["soft"] as const : config.methodOrder;
+		const session = ctx.sessionManager.getSessionId();
+		const leaf = ctx.sessionManager.getLeafId();
+		const model = ctx.model;
+		const current = () => !event.signal.aborted && session === ctx.sessionManager.getSessionId() &&
+			leaf === ctx.sessionManager.getLeafId() && model === ctx.model;
+		try {
+			let recovered: SessionBeforeCompactEvent | undefined;
+			const readable = () => recovered ??= recoveredEvent(event);
+			for (const candidate of order) {
+				if (!current()) return { cancel: true };
+				if (candidate === "remote") {
+					if (!supportsRemote(model)) continue;
+					ctx.ui.setStatus("compaction", "Codex remote compaction…");
+					try {
+						const restored = readable();
+						const prefix = projectPrefix(restored.branchEntries, event.preparation.firstKeptEntryId);
+						const prior = readableSummary(restored.branchEntries, prefix, 48_000);
+						const result = await remoteCompact(pi, ctx, event, {
+							portableSummary: remotePortableSummary(prior, prefix),
+							fetch: options.remoteFetch,
+							readable: prefix.map(message => message.role === "compactionSummary" && prior ? { ...message, summary: prior } : message),
+							withPrior: restored === event ? prefix : projectPrefix(event.branchEntries, event.preparation.firstKeptEntryId),
+						});
+						if (!current()) return { cancel: true };
+						if (result) {
+							ctx.ui.notify("Codex remote compaction complete.", "info");
+							return result;
+						}
+					} catch (error) {
+						if (!current()) return { cancel: true };
+						ctx.ui.notify(`Codex remote compaction failed; trying the next method. ${error instanceof Error ? error.message : String(error)}`, "warning");
+					} finally {
+						ctx.ui.setStatus("compaction", undefined);
+					}
+				} else if (candidate === "snapcompact") {
+					const result = await snapcompact(readable(), ctx, config);
+					if (!current()) return { cancel: true };
+					if (result) return result;
+				} else {
+					const result = await compactReadable(pi, ctx, readable(), parsed.focus);
+					return current() ? { compaction: result } : { cancel: true };
+				}
+			}
+			ctx.ui.notify("No configured compaction method succeeded; history left unchanged.", "warning");
+		} catch (error) {
+			if (current()) ctx.ui.notify(`Compaction failed; history left unchanged. ${error instanceof Error ? error.message : String(error)}`, "error");
+		}
+		return { cancel: true };
 	});
 
 	// Re-attach the latest compaction's frames, optionally image large tool
@@ -464,8 +520,20 @@ export default function snapcompactExtension(pi: ExtensionAPI): void {
 		const summaryIndex = event.messages.findIndex(message => message.role === "compactionSummary");
 		if (summaryIndex >= 0) {
 			const message = event.messages[summaryIndex];
-			const entry = ctx.sessionManager.getBranch().findLast(item => item.type === "compaction");
+			const branch = ctx.sessionManager.getBranch();
+			const entry = branch.findLast(item => item.type === "compaction");
 			if (message.role === "compactionSummary" && entry?.type === "compaction" && entry.summary === message.summary) {
+				if (isRemoteEntry(entry) && checkpointEdited(branch, entry)) {
+					let summary = "An earlier remote checkpoint was invalidated by a context edit. Run /compact soft to rebuild it from the saved branch.";
+					try {
+						const readable = readableBranch(branch);
+						const prefix = projectPrefix(readable, entry.firstKeptEntryId);
+						summary = remotePortableSummary(readableSummary(readable, prefix, 16_000), prefix);
+					} catch { /* Never send the invalidated excerpt. */ }
+					messages = messages.slice();
+					messages[summaryIndex] = { ...message, summary };
+					changed = true;
+				}
 				const archive = getPreservedArchive(entry.details as Record<string, unknown> | undefined);
 				if (archive) {
 					const limit = vision ? Math.max(0, imageBudget - countImages(messages)) : 0;
@@ -529,7 +597,7 @@ export default function snapcompactExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("compaction", {
-		description: "Configure snapcompact: method, picker, frames, shape, tool-result imaging, blobs",
+		description: "Configure compaction fallback order, picker, Snapcompact frames, and blob storage",
 		handler: async (_args, ctx) => {
 			const config = loadConfig();
 
@@ -547,7 +615,7 @@ export default function snapcompactExtension(pi: ExtensionAPI): void {
 				);
 				const blobs = blobStats();
 				const choice = await ctx.ui.select("Compaction settings", [
-					`Default method: ${config.default}`,
+					`Fallback order: ${config.methodOrder.join(" → ")}`,
 					`Method picker on /compact: ${config.picker ? "on" : "off"}`,
 					`Max frames per archive: ${config.maxFrames} (effective cap ${frameCap})`,
 					`Frame shape: ${config.shape}${shape ? ` → ${shapeLabel(shape)}` : ""}`,
@@ -558,10 +626,12 @@ export default function snapcompactExtension(pi: ExtensionAPI): void {
 				]);
 				if (!choice) return;
 
-				if (choice.startsWith("Default method")) {
-					const picked = await ctx.ui.select("Default compaction method", [SNAP_LABEL, SOFT_LABEL]);
-					if (!picked) continue;
-					config.default = picked === SNAP_LABEL ? "snapcompact" : "soft";
+				if (choice.startsWith("Fallback order")) {
+					const value = await ctx.ui.input("Methods in order (remote, snapcompact, soft)", config.methodOrder.join(", "));
+					if (value === undefined) continue;
+					const order = methodOrder(value.split(",").map(word => word.trim().toLowerCase()));
+					if (!order) { ctx.ui.notify("Enter a comma-separated list of compaction methods.", "error"); continue; }
+					config.methodOrder = order;
 				} else if (choice.startsWith("Method picker")) {
 					config.picker = !config.picker;
 				} else if (choice.startsWith("Max frames")) {

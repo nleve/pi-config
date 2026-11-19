@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
-import snapcompact from "../snapcompact/index";
-import { textArchiveCharBudget } from "../snapcompact/budget";
-import { resolveImageCountBudget } from "../snapcompact/tuning";
-import { NEWLINE_GLYPH, PRESERVE_KEY, type Archive, viewWithoutFrames } from "../snapcompact/vendor/snapcompact";
+import snapcompact from "../compaction/index";
+import { textArchiveCharBudget } from "../compaction/budget";
+import { resolveImageCountBudget } from "../compaction/tuning";
+import { NEWLINE_GLYPH, PRESERVE_KEY, type Archive, viewWithoutFrames } from "../compaction/vendor/snapcompact";
 
 const image = { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" };
 const frame = { ...image, cols: 80, rows: 20, chars: 15 };
