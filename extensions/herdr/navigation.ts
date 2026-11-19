@@ -24,6 +24,7 @@ export const SPAWN_ENTRY_TYPE = "herdr_spawn";
 export interface SpawnEntry {
 	action: "spawn" | "agent_start";
 	name: string;
+	label?: string;
 	pane_id?: string;
 	session_path?: string;
 	session_id?: string;
@@ -31,6 +32,7 @@ export interface SpawnEntry {
 	model?: string;
 	group?: string;
 	stage?: string;
+	workspace_id?: string;
 	parent_session_id?: string;
 	parent_pane_id?: string;
 	parent_name?: string;
@@ -55,7 +57,9 @@ export function parseSpawnEntry(data: unknown): SpawnEntry | undefined {
 	if (typeof rec.session_id === "string") entry.session_id = rec.session_id;
 	if (typeof rec.cwd === "string") entry.cwd = rec.cwd;
 	if (typeof rec.model === "string") entry.model = rec.model;
+	if (typeof rec.label === "string") entry.label = rec.label;
 	if (typeof rec.group === "string") entry.group = rec.group;
+	if (typeof rec.workspace_id === "string") entry.workspace_id = rec.workspace_id;
 	if (typeof rec.stage === "string") entry.stage = rec.stage;
 	if (typeof rec.parent_session_id === "string") entry.parent_session_id = rec.parent_session_id;
 	if (typeof rec.parent_pane_id === "string") entry.parent_pane_id = rec.parent_pane_id;
@@ -131,8 +135,10 @@ export function resolveIdentity(entry: SpawnEntry, identities: readonly AgentIde
 function workerIsLive(
 	entry: SpawnEntry,
 	identity: AgentIdentity | undefined,
-	liveAgents: { names: Set<string> } | undefined,
+	liveAgents: { names: Set<string>; paths: Set<string> } | undefined,
 ): boolean {
+	const file = entry.session_path ?? identity?.session_path;
+	if (liveAgents && file) return liveAgents.paths.has(file);
 	return (liveAgents?.names.has(entry.name) ?? false) || (identity !== undefined && isAlive(identity.pid));
 }
 
@@ -146,20 +152,23 @@ function groupStage(entry: SpawnEntry): string | undefined {
  * the call fails. `agent list` is the authoritative liveness signal; the pid in
  * the registry cannot tell a reused pid from a still-running worker.
  */
-async function fetchLiveAgents(): Promise<{ panes: Set<string>; names: Set<string> } | undefined> {
+async function fetchLiveAgents(): Promise<{ panes: Set<string>; names: Set<string>; paths: Set<string> } | undefined> {
 	try {
 		const { result } = await callHerdr({ args: ["agent", "list"], timeoutMs: 30000 });
 		const rec = asRecord(result);
 		const raw = Array.isArray(rec?.agents) ? (rec.agents as Record<string, unknown>[]) : [];
 		const panes = new Set<string>();
 		const names = new Set<string>();
+		const paths = new Set<string>();
 		for (const agent of raw) {
+			const session = asString(asRecord(agent.agent_session)?.value);
+			if (session) paths.add(session);
 			const pane = asString(agent.pane_id);
 			if (pane) panes.add(pane);
 			const name = asString(agent.name);
 			if (name) names.add(name);
 		}
-		return { panes, names };
+		return { panes, names, paths };
 	} catch {
 		return undefined;
 	}
@@ -235,26 +244,31 @@ export function registerNavigation(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** Resume a closed worker in a fresh pane split from the caller's pane. */
+	/** Resume an explicitly selected closed worker in a full-size tab. */
 	async function resumeClosed(ctx: ExtensionContext, entry: SpawnEntry): Promise<void> {
 		// A bare `pi --resume` picks the most recent session, which may belong to a
 		// different worker: never resume without the recorded transcript.
 		if (!entry.session_path) {
 			throw new Error(`cannot resume ${entry.name}: no session path recorded`);
 		}
-		const callerPane = process.env.HERDR_PANE_ID;
-		if (!callerPane) throw new Error("HERDR_PANE_ID is not set; cannot split a pane");
-		const args = ["pane", "split", "--pane", callerPane, "--direction", "down"];
+		let workspace = process.env.HERDR_WORKSPACE_ID;
+		if (entry.workspace_id && entry.group) {
+			const { result } = await callHerdr({ args: ["workspace", "get", entry.workspace_id], timeoutMs: 3000 }).catch(() => ({ result: undefined }));
+			const tokens = asRecord(asRecord(asRecord(result)?.workspace)?.tokens);
+			if (tokens?.delegate_owner === ctx.sessionManager.getSessionId()) workspace = entry.workspace_id;
+		}
+		if (!workspace) throw new Error("HERDR_WORKSPACE_ID is not set; cannot create a tab");
+		const args = ["tab", "create", "--workspace", workspace, "--label", entry.label || entry.name, "--no-focus"];
 		if (entry.cwd) args.push("--cwd", entry.cwd);
 		const { result } = await callHerdr({ args, timeoutMs: 30000 });
-		const pane = asRecord(asRecord(result)?.pane);
-		const newPane = asString(pane?.pane_id);
-		const tabId = asString(pane?.tab_id);
-		if (!newPane) throw new Error("pane split returned no pane id");
+		const placement = asRecord(result);
+		const newPane = asString(asRecord(placement?.root_pane)?.pane_id);
+		const tabId = asString(asRecord(placement?.tab)?.tab_id);
+		if (!newPane) throw new Error("tab create returned no pane id");
 		// Anything after the split can fail; close the fresh pane on any failure so
 		// a rejected `pane run` cannot leak an orphaned split.
 		try {
-			const command = `pi --session ${shellQuote(entry.session_path)}`;
+			const command = `pi ${entry.label ? "-xt herdr,delegate,delegate_result " : ""}--session ${shellQuote(entry.session_path)}`;
 			await callHerdr({ args: ["pane", "run", newPane, command], timeoutMs: 30000 });
 			// `pane run` only types the command and presses Enter, so confirm pi
 			// actually came up before recording the pane. Otherwise a silent failure
@@ -273,7 +287,7 @@ export function registerNavigation(pi: ExtensionAPI): void {
 	}
 
 	/** `/children` picker: list spawned agents and open the chosen one. */
-	async function openChildren(ctx: ExtensionContext): Promise<void> {
+	async function openChildren(ctx: ExtensionContext, scope: "live" | "offline" | "all" = "live"): Promise<void> {
 		if (!herdrReady(ctx)) return;
 		if (!ctx.hasUI) {
 			ctx.ui.notify("children requires an interactive UI", "warning");
@@ -286,13 +300,21 @@ export function registerNavigation(pi: ExtensionAPI): void {
 		}
 		const identities = readIdentities();
 		const liveAgents = await fetchLiveAgents();
+		if (!liveAgents) {
+			ctx.ui.notify("Could not verify live workers in Herdr. No session was reopened.", "warning");
+			return;
+		}
 		const items: PickerItem[] = entries.map((entry) => {
 			const identity = resolveIdentity(entry, identities);
 			const live = workerIsLive(entry, identity, liveAgents);
 			const meta = [groupStage(entry), entry.model].filter(Boolean).join("  ");
-			const label = `${live ? "●" : "○"} ${entry.name}${meta ? `  ${meta}` : ""}  ${live ? "live" : "closed"}`;
+			const label = `${live ? "●" : "○"} ${entry.label ? `${entry.label} · ` : ""}${entry.name}${meta ? `  ${meta}` : ""}  ${live ? "live" : "closed"}`;
 			return { label, entry, identity, live };
-		});
+		}).filter(item => scope === "all" || (scope === "live" ? item.live : !item.live));
+		if (!items.length) {
+			ctx.ui.notify(scope === "live" ? "No live workers. Use /children offline for closed sessions." : "No matching workers.", "info");
+			return;
+		}
 		const byLabel = new Map<string, PickerItem>();
 		for (const item of items) byLabel.set(item.label, item);
 		const choice = await ctx.ui.select(
@@ -341,9 +363,8 @@ export function registerNavigation(pi: ExtensionAPI): void {
 				? findIdentity(own.parent_name, identities)
 				: undefined;
 		const targets: string[] = [];
-		// Prefer the name handle; focusing a name cannot hit a recycled pane.
-		if (own.parent_name) targets.push(own.parent_name);
-		else if (parent && isAlive(parent.pid)) targets.push(parent.name);
+		// An offline parent may share its former display name with a new session.
+		if (parent && isAlive(parent.pid)) targets.push(parent.name);
 		if (own.parent_pane_id && parent && parent.pane_id === own.parent_pane_id && isAlive(parent.pid)) {
 			targets.push(own.parent_pane_id);
 		}
@@ -363,9 +384,10 @@ export function registerNavigation(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("children", {
-		description: "Focus or resume an agent spawned from this session",
-		handler: async (_args, ctx) => {
-			await openChildren(ctx);
+		description: "Focus a live child; /children offline (or all) shows sessions to resume",
+		handler: async (args, ctx) => {
+			const scope = args.trim();
+			await openChildren(ctx, scope === "offline" || scope === "all" ? scope : "live");
 		},
 	});
 	pi.registerShortcut(Key.ctrlShift("a"), {

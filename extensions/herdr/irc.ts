@@ -31,7 +31,7 @@ import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { enqueue, envelopeKey, listPending, removeMessage, sweepMailboxes } from "./mailbox.ts";
-import { isAlive, readIdentities } from "./registry.ts";
+import { workerHandle } from "./mentions.ts";
 
 export type IrcScope = "self" | "tab" | "workspace" | "all";
 /** Delivery mode while the recipient is busy. `reject` is intentionally gone. */
@@ -91,43 +91,15 @@ export interface IrcPeer {
 	self?: boolean;
 }
 
-/** A durable registry identity, structurally compatible with `AgentIdentity`. */
-export interface IrcDurableIdentity {
-	pane_id: string;
-	name?: string;
-	session_id?: string;
-	pid?: number;
-}
-
-/**
- * Broadcast recipient set: live peers (already scoped) unioned with durable
- * registry identities. A dormant identity (pid gone) has no live pane, so it
- * becomes a mailbox-only target; a live one keeps its pane for the doorbell.
- * The sender is skipped and targets are de-duplicated by mailbox key.
- */
-export function broadcastTargets(
-	peers: readonly IrcPeer[],
-	durable: readonly IrcDurableIdentity[],
-	selfPane: string,
-): IrcTarget[] {
-	const out: IrcTarget[] = [];
+/** Snapshot the live, already scoped roster; never broadcast into offline mailboxes. */
+export function broadcastTargets(peers: readonly IrcPeer[], selfPane: string): IrcTarget[] {
 	const seen = new Set<string>();
-	const add = (target: IrcTarget) => {
-		if (!target.mailboxKey || target.paneId === selfPane || seen.has(target.mailboxKey)) return;
-		seen.add(target.mailboxKey);
-		out.push(target);
-	};
-	for (const p of peers) {
-		if (p.self || p.pane_id === selfPane) continue;
-		add({ mailboxKey: p.mailboxKey ?? p.pane_id, paneId: p.pane_id, identity: p.identity });
-	}
-	for (const d of durable) {
-		if (d.pane_id === selfPane) continue;
-		add({
-			mailboxKey: d.session_id ?? d.pane_id,
-			...(d.pid !== undefined && isAlive(d.pid) ? { paneId: d.pane_id } : {}),
-			identity: d.name ?? d.pane_id,
-		});
+	const out: IrcTarget[] = [];
+	for (const peer of peers) {
+		const key = peer.mailboxKey ?? peer.pane_id;
+		if (!key || peer.self || peer.pane_id === selfPane || seen.has(key)) continue;
+		seen.add(key);
+		out.push({ mailboxKey: key, paneId: peer.pane_id, identity: peer.identity });
 	}
 	return out;
 }
@@ -650,7 +622,7 @@ const ircModeSchema = Type.Union([Type.Literal("steer"), Type.Literal("followUp"
 const ircSchema = Type.Object({
 	action: Type.Union([Type.Literal("send"), Type.Literal("wait"), Type.Literal("roster")]),
 	to: Type.Optional(
-		Type.String({ description: 'send: target agent name, session id, or pane id, or "all" to broadcast' }),
+		Type.String({ description: 'send: exact ^^handle, agent name, session ID, or pane ID. Use "all" for a live broadcast in scope.' }),
 	),
 	body: Type.Optional(Type.String({ description: "send: message text" })),
 	replyTo: Type.Optional(Type.String({ description: "send: id of the message being replied to" })),
@@ -715,9 +687,9 @@ export function registerIrcTool(pi: ExtensionAPI, deps: IrcToolDeps): void {
 
 	pi.registerTool({
 		name: "irc",
-		label: "IRC",
+		label: "Message Agents",
 		description:
-			"Agent-to-agent messaging (IRC) between coding agents that run this extension. Messages are delivered to a durable per-agent mailbox, so a message to an agent that is not currently running waits until it next runs. `roster` lists reachable peers, `send` parks a message for a peer or broadcasts, and `wait` blocks for the next incoming message. Incoming messages are also injected into your session automatically, so you only need `wait` when you want to block for a reply.",
+			"Message existing Pi workers by ^^handle, list live peers, or wait for a reply. An exact offline handle can receive durable mail, but it won't wake up. Use delegate_result to collect a new assignment, not IRC.",
 		promptSnippet: "Message other agents (IRC) and wait for replies",
 		promptGuidelines: [
 			"Use `irc` to talk to peer agents: `roster` to see who is reachable, `send` to message one (`to: <name|pane>`) or broadcast (`to: \"all\"`), `wait` to block for the next message.",
@@ -728,7 +700,7 @@ export function registerIrcTool(pi: ExtensionAPI, deps: IrcToolDeps): void {
 			"When sending, set `expectsReply: true` only if you actually need an answer; leave it unset (or `false`) for FYIs and broadcasts so peers do not reply needlessly.",
 		],
 		parameters: ircSchema,
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			const scope = (params.scope ?? "workspace") as IrcScope;
 			if (params.action === "roster") {
 				const list = await peers(scope);
@@ -746,11 +718,9 @@ export function registerIrcTool(pi: ExtensionAPI, deps: IrcToolDeps): void {
 					expectsReply: params.expectsReply,
 				};
 				const targets: IrcTarget[] = [];
-				if (!to || to === "all") {
-					// Broadcast is not workspace-scoped: force scope "all" and union live
-					// peers with the durable registry, so other workspaces and dormant
-					// (no live pane) identities get a mailbox-only target too.
-					targets.push(...broadcastTargets(await peers("all"), readIdentities(), node.paneId));
+				if (!to) throw new Error('irc send: provide a target or explicitly use to:"all" to broadcast to live agents in scope.');
+				if (to === "all") {
+					targets.push(...broadcastTargets(await peers(scope), node.paneId));
 				} else {
 					const resolved = await deps.resolveTarget(to);
 					if (!resolved) throw new Error(`irc send: no agent named, at session, or at pane "${to}"`);
@@ -774,7 +744,15 @@ export function registerIrcTool(pi: ExtensionAPI, deps: IrcToolDeps): void {
 						});
 					}
 				}
+				// A durable mailbox ack is not a read receipt. Don't claim a
+				// dormant target woke up, or show a new receipt for a duplicate.
+				const target = targets[0];
+				if (ctx.mode === "tui" && to && to !== "all" && target && !target.paneId && mailboxed.length === 1) {
+					const handle = target.identity ? workerHandle(target.identity) : target.mailboxKey;
+					ctx.ui.notify(`Queued for ${handle} (dormant)`, "info");
+				}
 				const out = {
+					...(to === "all" ? { scope, recipients: targets.length } : {}),
 					mailboxed,
 					...(duplicate.length ? { duplicate } : {}),
 					...(failed.length ? { failed } : {}),

@@ -9,11 +9,7 @@
  */
 
 import { Type, type Static } from "typebox";
-import type {
-	AutocompleteProviderFactory,
-	ExtensionAPI,
-	ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import { CustomEditor, type AutocompleteProviderFactory, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	callHerdr,
 	herdrAvailable,
@@ -26,13 +22,16 @@ import { formatIrcForModel, IrcNode, registerIrcTool, type IrcAgent, type IrcEnv
 import {
 	DelegateRegistry,
 	DELEGATE_ENTRY_TYPE,
-	findInstanceRefs,
+	parseSelectorLevel,
 	replaceMention,
 	type DelegateEntryLike,
 	type ModelLike,
 } from "./delegates.ts";
+import { highlightMentionRow } from "./mention-editor.ts";
+import { appendMentionRouting, draftMentions, modelMentionItems, renderMentionMessage, workerHandle, workerMentionItems, type MentionWorker } from "./mentions.ts";
 import { generateName, stageName } from "./names.ts";
-import { appendSpawnEntry, registerNavigation } from "./navigation.ts";
+import { registerDelegateTools } from "./delegate-tool.ts";
+import { appendSpawnEntry, readSpawnEntries, registerNavigation } from "./navigation.ts";
 import {
 	aggregateWorkflows,
 	panelMetadataArgs,
@@ -47,7 +46,6 @@ import {
 	mergeIdentity,
 	preferIdentity,
 	pruneDeadIdentities,
-	pruneRecycledIdentities,
 	readIdentities,
 	resolvePaneRef,
 	setIdentityGrouping,
@@ -1108,6 +1106,7 @@ export async function spawnAgent(
 	signal?: AbortSignal,
 	modelArgs: readonly string[] = [],
 	onPanePlaced?: (paneId: string) => void,
+	onStarted?: (name: string) => void,
 ): Promise<SpawnOutcome> {
 	const kind = "pi";
 	const mode = params.mode ?? "workspace";
@@ -1165,7 +1164,7 @@ export async function spawnAgent(
 		// spawns in the same stage do not all compute `<group>-<stage>-1`.
 		name = chooseName(params, group, stage);
 		const agentArgsFor = (workerName: string): string[] => [
-			...(nested ? [] : ["-xt", "herdr"]),
+			...(nested ? [] : ["-xt", "herdr,delegate,delegate_result"]),
 			"--name",
 			workerName,
 			...modelArgs,
@@ -1205,6 +1204,7 @@ export async function spawnAgent(
 	// The worker owns the name once it has registered; drop our in-flight
 	// reservation then, bounded so a slow registration cannot leak it.
 	if (paneId) releaseNameWhenRegistered(name, paneId, { session_path: sessionPath, startedAt });
+	onStarted?.(name);
 
 	let prompted = false;
 	let promptError: string | undefined;
@@ -1299,7 +1299,7 @@ export function scopeRecords<T extends ScopedRecord>(
 	const ws = env.HERDR_WORKSPACE_ID;
 	const keep = (r: T): boolean => {
 		const pane = typeof r.pane_id === "string" ? r.pane_id : undefined;
-		if (pane && spawned.has(pane)) return true; // always show our own children
+		if (scope === "workspace" && pane && spawned.has(pane)) return true;
 		switch (scope) {
 			case "self":
 				return pane === self;
@@ -1365,29 +1365,65 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		return parts.length > 0 ? parts[parts.length - 1] : cwd;
 	}
 
-	/**
-	 * `^^name` in a prompt → a legend resolving the reference to a live pane, so
-	 * the model can address the worker via the herdr tool `target` or IRC.
-	 * Unknown names are left literal.
-	 */
-	function expandInstances(text: string): { text: string; refs: { name: string; pane: string }[] } {
-		// Only live workers: a dormant entry's pane may have been recycled to an
-		// unrelated agent, so its `^^name → pane` legend would misdirect the model.
-		const byName = identityByName(readIdentities().filter((id) => isAlive(id.pid)));
-		const names = findInstanceRefs(text, new Set(byName.keys()));
-		if (names.length === 0) return { text, refs: [] };
-		const refs = names.map((name) => ({ name, pane: byName.get(name)!.pane_id }));
-		const legend = [
-			"Worker references (already-running agents; address them with the herdr tool `target` or `irc send to:`):",
-			...refs.map((r) => `  ^^${r.name} → ${r.pane}`),
-		].join("\n");
-		return { text: `${text}\n\n${legend}`, refs };
+	function ownedWorkerPaths(): Set<string> {
+		const ctx = currentCtx;
+		if (!ctx) return new Set();
+		const owner = ctx.sessionManager.getSessionId();
+		const recorded = readSpawnEntries(ctx).map(entry => entry.session_path);
+		const registered = readIdentities().filter(id => id.parent_session_id === owner).map(id => id.session_path);
+		return new Set([...recorded, ...registered].filter((file): file is string => !!file));
+	}
+
+	function spawnedInSession(rows: Record<string, unknown>[]): Set<string> {
+		const paths = ownedWorkerPaths();
+		return new Set(rows.flatMap(row => {
+			const file = sessionPathOf(row);
+			return file && paths.has(file) && typeof row.pane_id === "string" ? [row.pane_id] : [];
+		}));
+	}
+
+	/** Live scoped suggestions; a full handle can still address an offline or external worker. */
+	function mentionWorkers(exact?: string): MentionWorker[] {
+		const selfSession = currentCtx?.sessionManager.getSessionId();
+		const paths = ownedWorkerPaths();
+		return [...identityByName(readIdentities()).values()].flatMap((id) => {
+			const live = isAlive(id.pid);
+			if ((!live && !id.session_id) || workerHandle(id.name) === id.name) return [];
+			if ((live && id.pane_id === selfPane) || (selfSession && id.session_id === selfSession)) return [];
+			const local = live && (id.pane_id.split(":")[0] === process.env.HERDR_WORKSPACE_ID ||
+				(id.session_path && paths.has(id.session_path)));
+			if (exact !== undefined && !local && id.name !== exact) return [];
+			return [{ name: id.name, ...(live ? { pane: id.pane_id } : {}), project: id.task_label ?? projectName(id.cwd) }];
+		});
+	}
+
+	pi.registerMarkdownTransformer(renderMentionMessage, { messageTypes: ["user"] });
+
+	function installMentionHighlighting(ctx: ExtensionContext): void {
+		const previous = ctx.ui.getEditorComponent();
+		let workerSnapshot: { until: number; workers: MentionWorker[] } | undefined;
+		ctx.ui.setEditorComponent((tui, theme, keys) => {
+			const editor = previous?.(tui, theme, keys) ?? new CustomEditor(tui, theme, keys, { embedWorkingStatus: true });
+			const render = editor.render.bind(editor);
+			editor.render = (width) => {
+				const lines = render(width);
+				const mentions = draftMentions(editor.getText(), sessionModels, delegates, () => {
+					if (!workerSnapshot || workerSnapshot.until < Date.now()) {
+						workerSnapshot = { until: Date.now() + 750, workers: mentionWorkers() };
+					}
+					return workerSnapshot.workers;
+				});
+				if (!mentions.size) return lines;
+				const palette = ctx.ui.theme;
+				return lines.map(line => highlightMentionRow(line, mentions, (kind, text) =>
+					palette.fg(kind === "model" ? "accent" : kind === "worker" ? "success" : "muted", text),
+				));
+			};
+			return editor;
+		});
 	}
 
 	// ---- Composer autocomplete for `^model` / `^^worker` ---------------------
-	type MentionProvider = Parameters<AutocompleteProviderFactory>[0];
-	type MentionItem = Parameters<MentionProvider["applyCompletion"]>[3];
-
 	function mentionAtCursor(
 		line: string,
 		col: number,
@@ -1400,39 +1436,17 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		return undefined;
 	}
 
-	function modelMentionItems(query: string): MentionItem[] {
-		const counts = new Map<string, number>();
-		for (const m of sessionModels) counts.set(m.id, (counts.get(m.id) ?? 0) + 1);
-		const q = query.toLowerCase();
-		return sessionModels
-			.map((m) => {
-				const selector = (counts.get(m.id) ?? 0) > 1 ? `${m.provider}/${m.id}` : m.id;
-				return { value: `^${selector}`, label: selector, description: m.provider };
-			})
-			.filter((it) => it.label.toLowerCase().includes(q))
-			.slice(0, 30);
-	}
-
-	function workerMentionItems(query: string): MentionItem[] {
-		const q = query.toLowerCase();
-		return readIdentities()
-			.filter((i) => i.pane_id !== selfPane)
-			.map((i) => ({
-				value: `^^${i.name}`,
-				label: i.name,
-				description: [i.pane_id, i.cwd ? projectName(i.cwd) : undefined].filter(Boolean).join(" · "),
-			}))
-			.filter((it) => it.label.toLowerCase().includes(q))
-			.slice(0, 30);
-	}
-
 	const makeMentionAutocomplete: AutocompleteProviderFactory = (current) => ({
 		triggerCharacters: [...(current.triggerCharacters ?? []), "^"],
 		async getSuggestions(lines, cursorLine, cursorCol, options) {
-			const mention = mentionAtCursor(lines[cursorLine] ?? "", cursorCol);
+			const draft = (lines.find((line) => line.trim()) ?? "").trimStart();
+			const mention = draft.startsWith("!") || draft.startsWith("$")
+				? undefined
+				: mentionAtCursor(lines[cursorLine] ?? "", cursorCol);
 			if (mention) {
-				const query = mention.query.split(":")[0] ?? "";
-				const items = mention.double ? workerMentionItems(query) : modelMentionItems(query);
+				const items = mention.double
+					? workerMentionItems(mentionWorkers(mention.query), mention.query)
+					: modelMentionItems(sessionModels, mention.query);
 				if (items.length > 0) return { items, prefix: mention.prefix };
 			}
 			return current.getSuggestions(lines, cursorLine, cursorCol, options);
@@ -1525,6 +1539,8 @@ export default function herdrExtension(pi: ExtensionAPI) {
 			group: self?.group,
 			stage: self?.stage,
 			project: dir,
+			task: self?.task_label,
+			parent: self?.parent_name,
 		});
 		const key = args.join(" ");
 		if (key === lastPanelMetaKey) return;
@@ -1542,11 +1558,6 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		// into the pi event handler and skip IRC/autocomplete setup.
 		try {
 			pruneDeadIdentities();
-		} catch {
-			/* best-effort */
-		}
-		try {
-			pruneRecycledIdentities();
 		} catch {
 			/* best-effort */
 		}
@@ -1580,6 +1591,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 					...owned,
 					group: inherit?.group,
 					stage: inherit?.stage,
+					task_label: inherit?.task_label,
 					parent_session_id: inherit?.parent_session_id,
 					parent_pane_id: inherit?.parent_pane_id,
 					parent_name: inherit?.parent_name,
@@ -1621,6 +1633,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 	let currentCtx: ExtensionContext | undefined;
 
 	pi.on("session_start", (_event, ctx) => {
+		if (currentCtx && currentCtx.sessionManager.getSessionId() !== ctx.sessionManager.getSessionId()) spawned.clear();
 		sessionModels = modelsFromCtx(ctx);
 		currentCtx = ctx;
 		delegates.sync(ctx.sessionManager.getBranch() as unknown as readonly DelegateEntryLike[]);
@@ -1636,6 +1649,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		if (!autocompleteRegistered && ctx.mode === "tui") {
 			autocompleteRegistered = true;
 			ctx.ui.addAutocompleteProvider(makeMentionAutocomplete);
+			installMentionHighlighting(ctx);
 		}
 		void reconcileName(ctx);
 	});
@@ -1665,10 +1679,9 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		if (delegates.all.length === 0) {
 			delegates.sync(ctx.sessionManager.getBranch() as unknown as readonly DelegateEntryLike[]);
 		}
-		const expanded = delegates.expand(event.text);
-		const inst = expandInstances(expanded.text);
-		if (expanded.delegates.length === 0 && inst.refs.length === 0) return { action: "continue" };
-		return { action: "transform", text: inst.text };
+		const { legend } = delegates.expand(event.text);
+		const text = appendMentionRouting(event.text, legend, event.text.includes("^^") ? mentionWorkers() : []);
+		return text === event.text ? { action: "continue" } : { action: "transform", text };
 	});
 
 	// ---- IRC: durable mailbox + unix-socket doorbell ------------------------
@@ -1689,7 +1702,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		const rec = asRecord(result);
 		const raw = Array.isArray(rec?.agents) ? (rec.agents as Record<string, unknown>[]) : [];
 		const enriched = withIdentities(raw, identities());
-		return scopeRecords(enriched as ScopedRecord[], scope, spawned).shown as unknown as IrcAgent[];
+		return scopeRecords(enriched as ScopedRecord[], scope, spawnedInSession(raw)).shown as unknown as IrcAgent[];
 	};
 
 	/**
@@ -1797,6 +1810,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 			const found = findIdentity(ref, identities());
 			if (found) {
 				const live = isAlive(found.pid);
+				if (!live && !found.session_id) return undefined;
 				return {
 					mailboxKey: found.session_id ?? found.pane_id,
 					...(live ? { paneId: found.pane_id } : {}),
@@ -1816,18 +1830,51 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		registerIrcTool(pi, { node, listAgents, resolveTarget });
 		pi.on("session_shutdown", () => node.stop());
 	}
+	if (herdrAvailable() && paneId) {
+		registerDelegateTools(pi, {
+			parentName: ownName,
+			spawned,
+			modelArgs(selector, ctx) {
+				if (!selector?.trim()) {
+					const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+					return { model, args: model ? ["--model", model, "--thinking", ctx.thinkingLevel] : [] };
+				}
+				const token = selector.trim();
+				const exact = token.startsWith("^") ? delegates.find(token) : undefined;
+				if (exact?.token === token.slice(1)) return { model: exact.selector, args: ["--model", exact.selector, ...(exact.thinking ? ["--thinking", exact.thinking] : [])] };
+				const parsed = parseSelectorLevel(token.replace(/^\^/, ""), modelsFromCtx(ctx));
+				if (!parsed) throw new Error(`delegate: unknown, ambiguous, or unsupported model selection "${token}". Choose an available ^model[:thinking].`);
+				const model = `${parsed.model.provider}/${parsed.model.id}`;
+				return { model, args: ["--model", model, ...(parsed.level ? ["--thinking", parsed.level] : [])] };
+			},
+		});
+	}
+
+	pi.registerCommand("workers", {
+		description: "Quick reference for delegating, messaging and navigating Pi workers in Herdr",
+		async handler(_args, ctx) {
+			ctx.ui.notify([
+				"New task: ^model[:thinking] → delegate; collect later with delegate_result(ticket).",
+				"Follow up: ^^handle → IRC. Offline mail waits for resume.",
+				"Find: Herdr prefix+g, then / to search. Flip: prefix+n/p for tabs in this run, prefix+a/Shift+A for all agents.",
+				"Return: /parent. Your workers: /children (add offline to see closed sessions).",
+			].join("\n"), "info");
+		},
+	});
+
 	pi.registerTool({
 		name: "herdr",
-		label: "Herdr",
+		label: "Herdr (Advanced)",
+		exposure: "codemode",
 		description:
 			"herdr is a terminal workspace manager (like tmux) that hosts multiple AI coding agents at once. It organizes terminals as workspaces → tabs → panes. This tool drives that cluster from inside pi: list/inspect agents and panes, spawn pi workers in new panes, workspaces, or git worktrees, send them prompts, wait for their turns to settle, and read their structured results. Every worker is a pi agent — spawn one per model/thinking level to create ad-hoc teammates on the fly. Only works when pi itself is running inside herdr (HERDR_ENV=1); otherwise the tool reports that it is unavailable.",
-		promptSnippet: "Spawn and drive ad-hoc pi workers in herdr panes to delegate work",
+		promptSnippet: "Advanced Herdr pane, workspace, and worker inspection or recovery; use delegate for a new assignment",
 		promptGuidelines: [
 			"herdr is a terminal workspace manager (like tmux) that runs many AI coding agents side by side, organized as workspaces → tabs → panes, with one agent per pane. This tool is how you observe and drive those agents from inside pi. Every worker is a pi agent.",
 			"Start with `agents` and `panes` to discover what is running, then target an agent by its name (auto-generated codenames like `amber-otter`) or hosting pane id (e.g. w3:pJ).",
 			"Roster and pane listings default to `scope: workspace` — only agents sharing your workspace, plus anything this session spawned; pass `scope: all` to see every agent in the herdr session.",
 			"To run a worker on a specific model, pass `model` (a `provider/id` selector or a `^selector[:level]` delegate) and optional `thinking` to `spawn`/`agent_start`; `spawn` compiles them to `--model`/`--thinking`. Omit `name` to get a memorable codename.",
-			"When the user writes `^selector[:level]` in a prompt, they are asking you to delegate to that model — spawn a worker with `model` set to the token. `^^name` refers to an already-running worker (address it by name).",
+			"When the user writes `^selector[:level]` in a prompt, they are asking you to delegate to that model — spawn a worker with `model` set to the token. `^^name` refers to a named worker; use its live pane or IRC when live, and its IRC mailbox only when dormant.",
 			"Delegate with `agent_prompt` (which returns `baseline_seq`), then call `agent_result` with `since` set to that baseline to wait (event-driven, no polling) for the turn to settle and return the worker's structured result — its final message, model, and usage — read from the pi session transcript. Use `agent_read`/`agent_wait` only for raw terminal inspection.",
 			"`spawn` creates a fresh isolated worker (its own workspace, or a git worktree); workers get the `herdr` tool denied so they cannot spawn their own subagents — pass `nested: true` to allow nesting.",
 			"Give a fan-out a workflow shape with `group` + `stage`: workers then share one herdr workspace (label=group) and one tab per stage, their names default to `<group>-<stage>-<n>`, and the roster reports `group`/`stage`. Use it for multi-stage runs (e.g. dig → critique → judge); when only `group` is set, `stage` defaults to `main`.",
@@ -1851,6 +1898,8 @@ export default function herdrExtension(pi: ExtensionAPI) {
 					outcome = await spawnAgent(params, signal, modelArgsFor(params), (pane) => {
 						placedPane = pane;
 						spawned.add(pane);
+					}, (name) => {
+						if (params.notify !== false && ctx.mode === "tui") ctx.ui.notify(`Started ${workerHandle(name)}`, "info");
 					});
 				} catch (error) {
 					// spawnAgent rolled back its placement; drop the pane from scope too.
@@ -1883,14 +1932,13 @@ export default function herdrExtension(pi: ExtensionAPI) {
 				} catch {
 					/* best-effort */
 				}
-				// Only notify for a spawn that actually ran a prompt; a promptless
-				// worker is idle immediately and would fake "stage complete".
+				// Only announce stage completion for a spawn that ran a prompt.
 				if (outcome.prompted && outcome.group && params.notify !== false) {
 					void notifyIfStageDone(outcome.group, outcome.stage ?? "main");
 				}
 				return {
-					content: [{ type: "text", text: renderHerdrResult(outcome) }],
-					details: { action: "spawn", ...outcome },
+					content: [{ type: "text", text: renderHerdrResult({ ...outcome, handle: workerHandle(outcome.name) }) }],
+					details: { action: "spawn", ...outcome, handle: workerHandle(outcome.name) },
 				};
 			}
 			if (params.action === "agent_result") {
@@ -1993,7 +2041,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 				const nested = params.nested === true;
 				const modelArgs = modelArgsFor(params);
 				const agentArgsFor = (workerName: string): string[] => [
-					...(nested ? [] : ["-xt", "herdr"]),
+					...(nested ? [] : ["-xt", "herdr,delegate,delegate_result"]),
 					"--name",
 					workerName,
 					...modelArgs,
@@ -2087,9 +2135,11 @@ export default function herdrExtension(pi: ExtensionAPI) {
 				const timeoutMs = (params.timeout ?? 110000) + 15000;
 				({ result } = await callHerdr({ args, timeoutMs }, signal));
 			}
-			let scoped = applyScope(params, result, spawned);
+			const agentRows = asRecord(result)?.agents;
+			let scoped = applyScope(params, result, spawnedInSession(Array.isArray(agentRows) ? agentRows : []));
 			if (params.action === "agent_start" && effectiveName) {
-				scoped = { ...(asRecord(scoped) ?? {}), name: effectiveName };
+				scoped = { ...(asRecord(scoped) ?? {}), name: effectiveName, handle: workerHandle(effectiveName) };
+				if (params.notify !== false && ctx.mode === "tui") ctx.ui.notify(`Started ${workerHandle(effectiveName)}`, "info");
 			}
 			if (params.action === "agents") {
 				const rec = asRecord(scoped);

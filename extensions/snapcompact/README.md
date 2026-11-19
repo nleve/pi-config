@@ -18,10 +18,10 @@ API key, no latency beyond rendering (tens of ms).
 
 ## What is omp-exact vs ported
 
-The **engine** (`vendor/snapcompact.ts`) is omp's source verbatim — the only diff is import paths,
-a `Bun.stripANSI` shim, and the two prompt templates inlined as strings. Frame shape selection,
-foveation (HQ/LQ/HQ middle), text edges, the reading-guide summary, previous-archive carry-forward,
-and `¶think:` healing are byte-identical.
+The **engine** (`vendor/snapcompact.ts`) is a vendored OMP snapshot with import/runtime shims and
+inlined prompt templates. The bounded text-only reader view is a later upstream port: when the
+reader cannot take images or has no image slots left, it uses the saved transcript within the
+current window budget, keeping both ends if the middle must be cut.
 
 The **integration** is reimplemented on pi's extension API. The following pieces are ported from
 omp's native integration because they change behavior, not just plumbing:
@@ -153,8 +153,8 @@ vendor/pi-ai-types.ts    minimal type stand-ins (erased at runtime)
   System-prompt imaging — the cache-hostile variant — is not implemented.
 - **`/compact soft <focus>`.** pi reads `customInstructions` before the extension sees them, so a
   stripped `soft` token cannot be removed from focus text passed to the summarizer. Harmless.
-- **OpenAI `detail`.** pi's OpenAI serializer does not forward the engine's `imageDetail`, which is
-  harmless at the shapes' frame sizes (under the 2048 downscale threshold).
+- **OpenAI `detail`.** Pi 1.5.2 sends `auto` rather than forwarding the engine's `imageDetail`.
+  OMP's pricing and legibility estimates for `original` image detail do not directly carry over.
 
 ## Attribution
 

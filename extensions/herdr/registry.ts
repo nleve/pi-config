@@ -32,8 +32,10 @@ export interface AgentIdentity {
 	cwd?: string;
 	/** Workflow group (shared workspace label); set by the spawning orchestrator. */
 	group?: string;
-	/** Stage within the group (tab label). */
+	/** Stage within the workflow group. */
 	stage?: string;
+	/** Short task label, separate from the stable worker handle. */
+	task_label?: string;
 	/** Parent orchestrator link; set by the agent that spawned this one. */
 	parent_session_id?: string;
 	parent_pane_id?: string;

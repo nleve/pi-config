@@ -22,31 +22,93 @@ interface SearchResult {
 	snippet: string;
 }
 
+const NAMED_ENTITIES: Record<string, string> = {
+	nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'",
+};
+
 function decodeEntities(input: string): string {
-	return input
-		.replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
-		.replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
-		.replace(/&nbsp;/gi, " ")
-		.replace(/&amp;/gi, "&")
-		.replace(/&lt;/gi, "<")
-		.replace(/&gt;/gi, ">")
-		.replace(/&quot;/gi, '"')
-		.replace(/&#39;|&apos;/gi, "'");
+	return input.replace(/&(?:#(x[0-9a-f]+|\d+)|([a-z]+));/gi, (entity, numeric, name) => {
+		if (!numeric) return Object.hasOwn(NAMED_ENTITIES, name.toLowerCase()) ? NAMED_ENTITIES[name.toLowerCase()] : entity;
+		const hex = /^x/i.test(numeric);
+		const cp = Number.parseInt(hex ? numeric.slice(1) : numeric, hex ? 16 : 10);
+		return cp > 0 && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff) ? String.fromCodePoint(cp) : "\uFFFD";
+	});
 }
 
 function stripTags(html: string): string {
 	return decodeEntities(html.replace(/<[^>]*>/g, "")).replace(/\s+/g, " ").trim();
 }
 
-function unwrapDdg(href: string): string {
+// Based on OMP's DDG URL handling (ad4744d694): ads must not consume
+// organic result slots. Only unwrap redirects that actually belong to DDG.
+function unwrapDdg(href: string): string | undefined {
 	try {
-		const url = href.startsWith("//") ? new URL(href, "https://duckduckgo.com") : new URL(href);
-		const uddg = url.searchParams.get("uddg");
-		if (uddg) return uddg;
-		return href;
+		const url = new URL(href.startsWith("//") ? `https:${href}` : href);
+		const isDdg = /^(?:www\.)?duckduckgo\.com$/i.test(url.hostname);
+		if (isDdg && url.pathname === "/y.js") return;
+		const target = isDdg && /^\/l\/?$/.test(url.pathname) ? url.searchParams.get("uddg") : null;
+		const result = target ? new URL(target) : url;
+		if (/^(?:www\.)?duckduckgo\.com$/i.test(result.hostname) && result.pathname === "/y.js") return;
+		if (result.protocol === "http:" || result.protocol === "https:") return result.href;
 	} catch {
-		return href;
+		// Ignore invalid targets rather than recommending them to fetch.
 	}
+}
+
+const FETCH_MAX_BYTES = 4 * 1024 * 1024;
+const SEARCH_MAX_BYTES = 2 * 1024 * 1024;
+
+// Adapted from OMP's readBoundedBody. Cap actual decoded bytes, not the
+// Content-Length header (which may be absent or describe compressed bytes).
+async function readBoundedBody(res: Response, maxBytes: number): Promise<{ bytes: Uint8Array; truncated: boolean }> {
+	const reader = res.body?.getReader();
+	if (!reader) return { bytes: new Uint8Array(), truncated: false };
+
+	let buffer = new Uint8Array(Math.min(maxBytes, 64 * 1024));
+	let size = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) return { bytes: buffer.subarray(0, size), truncated: false };
+			const accepted = Math.min(value.byteLength, maxBytes - size);
+			if (size + accepted > buffer.length) {
+				const next = new Uint8Array(Math.min(maxBytes, Math.max(size + accepted, buffer.length * 2)));
+				next.set(buffer.subarray(0, size));
+				buffer = next;
+			}
+			buffer.set(value.subarray(0, accepted), size);
+			size += accepted;
+			if (accepted < value.byteLength) {
+				void reader.cancel().catch(() => {});
+				return { bytes: buffer.subarray(0, size), truncated: true };
+			}
+		}
+	} finally {
+		reader.releaseLock();
+	}
+}
+
+function decodeBody(bytes: Uint8Array, contentType = ""): string {
+	let charset = /charset\s*=\s*["']?([\w-]+)/i.exec(contentType)?.[1];
+	if (!charset && (!contentType || /html/i.test(contentType))) {
+		const head = new TextDecoder("latin1").decode(bytes.subarray(0, 2048));
+		charset = /<meta\b[^>]*charset\s*=\s*["']?([\w-]+)/i.exec(head)?.[1];
+	}
+	try {
+		return new TextDecoder(charset).decode(bytes);
+	} catch {
+		return new TextDecoder().decode(bytes);
+	}
+}
+
+async function readSearchBody(res: Response, label: string): Promise<string> {
+	if (!res.ok) {
+		void res.body?.cancel().catch(() => {});
+		throw new Error(`${label} returned HTTP ${res.status}`);
+	}
+	const { bytes, truncated } = await readBoundedBody(res, SEARCH_MAX_BYTES);
+	if (truncated) throw new Error(`${label} response exceeded ${SEARCH_MAX_BYTES} bytes`);
+	return decodeBody(bytes, res.headers.get("content-type") ?? "");
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, signal?: AbortSignal, ms = 25000): Promise<Response> {
@@ -59,38 +121,40 @@ async function fetchWithTimeout(url: string, init: RequestInit, signal?: AbortSi
 // Providers
 // ---------------------------------------------------------------------------
 
+// Match titles independently of href/class attribute order.
+const DDG_HTML_LINK = /<a\b(?=[^>]*\bclass=["'][^"']*\bresult__a\b[^"']*["'])(?=[^>]*\bhref=(?:"([^"]+)"|'([^']+)'))[^>]*>([\s\S]*?)<\/a>/i;
+const DDG_LITE_LINK = /<a\b(?=[^>]*\bclass=["'][^"']*\bresult-link\b[^"']*["'])(?=[^>]*\bhref=(?:"([^"]+)"|'([^']+)'))[^>]*>([\s\S]*?)<\/a>/gi;
+
+function ddgResult(link: RegExpMatchArray, snippet?: string): SearchResult | undefined {
+	const url = unwrapDdg(decodeEntities(link[1] ?? link[2]));
+	const title = stripTags(link[3]);
+	if (url && title) return { title, url, snippet: snippet ? stripTags(snippet) : "" };
+}
+
 function parseDdgHtml(html: string): SearchResult[] {
+	// Ported from OMP: pair optional previews with titles inside each
+	// result container, never by zipping two independent match lists.
+	const rows = /<div\b[^>]*\bclass=(?:"(?:[^"]*\s)?result(?:\s[^"]*)?"|'(?:[^']*\s)?result(?:\s[^']*)?')[^>]*>/gi;
 	const results: SearchResult[] = [];
-	const linkRe = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-	const snippetRe = /<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
-	const snippets: string[] = [];
-	let m: RegExpExecArray | null;
-	while ((m = snippetRe.exec(html))) snippets.push(stripTags(m[1]));
-	let i = 0;
-	while ((m = linkRe.exec(html))) {
-		results.push({
-			title: stripTags(m[2]),
-			url: unwrapDdg(decodeEntities(m[1])),
-			snippet: snippets[i++] ?? "",
-		});
+	for (const row of html.split(rows).slice(1)) {
+		const link = DDG_HTML_LINK.exec(row);
+		if (!link) continue;
+		const snippet = /<(a|div|span)\b[^>]*\bclass=["'][^"']*\bresult__snippet\b[^"']*["'][^>]*>([\s\S]*?)<\/\1>/i.exec(row);
+		const result = ddgResult(link, snippet?.[2]);
+		if (result) results.push(result);
 	}
 	return results;
 }
 
 function parseDdgLite(html: string): SearchResult[] {
+	const links = [...html.matchAll(DDG_LITE_LINK)];
 	const results: SearchResult[] = [];
-	const linkRe = /<a[^>]*class="result-link"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-	const snippetRe = /<td[^>]*class="result-snippet"[^>]*>([\s\S]*?)<\/td>/gi;
-	const snippets: string[] = [];
-	let m: RegExpExecArray | null;
-	while ((m = snippetRe.exec(html))) snippets.push(stripTags(m[1]));
-	let i = 0;
-	while ((m = linkRe.exec(html))) {
-		results.push({
-			title: stripTags(m[2]),
-			url: unwrapDdg(decodeEntities(m[1])),
-			snippet: snippets[i++] ?? "",
-		});
+	for (const [i, link] of links.entries()) {
+		const after = (link.index ?? 0) + link[0].length;
+		const row = html.slice(after, links[i + 1]?.index);
+		const snippet = /<td\b[^>]*\bclass=["'][^"']*\bresult-snippet\b[^"']*["'][^>]*>([\s\S]*?)<\/td>/i.exec(row);
+		const result = ddgResult(link, snippet?.[1]);
+		if (result) results.push(result);
 	}
 	return results;
 }
@@ -113,12 +177,11 @@ async function ddgSearch(query: string, count: number, signal?: AbortSignal): Pr
 			},
 			signal,
 		);
-		if (res.ok) {
-			const parsed = parseDdgHtml(await res.text()).slice(0, count);
-			if (parsed.length > 0) return parsed;
-		}
+		const parsed = parseDdgHtml(await readSearchBody(res, "DuckDuckGo")).slice(0, count);
+		if (parsed.length > 0) return parsed;
 	} catch {
-		/* fall through */
+		signal?.throwIfAborted();
+		// Try Lite if the HTML frontend failed.
 	}
 	// Lite endpoint fallback.
 	const res = await fetchWithTimeout(
@@ -126,8 +189,7 @@ async function ddgSearch(query: string, count: number, signal?: AbortSignal): Pr
 		{ headers: { "user-agent": UA, accept: "text/html", "accept-language": "en-US,en;q=0.9" }, redirect: "follow" },
 		signal,
 	);
-	if (!res.ok) throw new Error(`DuckDuckGo returned HTTP ${res.status}`);
-	return parseDdgLite(await res.text()).slice(0, count);
+	return parseDdgLite(await readSearchBody(res, "DuckDuckGo Lite")).slice(0, count);
 }
 
 async function braveSearch(query: string, count: number, signal?: AbortSignal): Promise<SearchResult[]> {
@@ -137,8 +199,7 @@ async function braveSearch(query: string, count: number, signal?: AbortSignal): 
 		{ headers: { accept: "application/json", "x-subscription-token": key } },
 		signal,
 	);
-	if (!res.ok) throw new Error(`Brave returned HTTP ${res.status}`);
-	const data = (await res.json()) as { web?: { results?: Array<{ title?: string; url?: string; description?: string }> } };
+	const data = JSON.parse(await readSearchBody(res, "Brave")) as { web?: { results?: Array<{ title?: string; url?: string; description?: string }> } };
 	return (data.web?.results ?? []).map((r) => ({
 		title: r.title ?? "",
 		url: r.url ?? "",
@@ -157,8 +218,7 @@ async function tavilySearch(query: string, count: number, signal?: AbortSignal):
 		},
 		signal,
 	);
-	if (!res.ok) throw new Error(`Tavily returned HTTP ${res.status}`);
-	const data = (await res.json()) as { results?: Array<{ title?: string; url?: string; content?: string }> };
+	const data = JSON.parse(await readSearchBody(res, "Tavily")) as { results?: Array<{ title?: string; url?: string; content?: string }> };
 	return (data.results ?? []).map((r) => ({
 		title: r.title ?? "",
 		url: r.url ?? "",
@@ -177,8 +237,7 @@ async function exaSearch(query: string, count: number, signal?: AbortSignal): Pr
 		},
 		signal,
 	);
-	if (!res.ok) throw new Error(`Exa returned HTTP ${res.status}`);
-	const data = (await res.json()) as { results?: Array<{ title?: string; url?: string; text?: string }> };
+	const data = JSON.parse(await readSearchBody(res, "Exa")) as { results?: Array<{ title?: string; url?: string; text?: string }> };
 	return (data.results ?? []).map((r) => ({
 		title: r.title ?? "",
 		url: r.url ?? "",
@@ -195,8 +254,7 @@ async function searxngSearch(query: string, count: number, signal?: AbortSignal)
 		{ headers },
 		signal,
 	);
-	if (!res.ok) throw new Error(`SearXNG returned HTTP ${res.status}`);
-	const data = (await res.json()) as { results?: Array<{ title?: string; url?: string; content?: string }> };
+	const data = JSON.parse(await readSearchBody(res, "SearXNG")) as { results?: Array<{ title?: string; url?: string; content?: string }> };
 	return (data.results ?? []).slice(0, count).map((r) => ({
 		title: r.title ?? "",
 		url: r.url ?? "",
@@ -220,8 +278,12 @@ async function runSearch(
 	signal?: AbortSignal,
 ): Promise<{ provider: string; results: SearchResult[] }> {
 	const available = availableProviders();
-	const chosen = provider && available.includes(provider) ? provider : (available[0] === "ddg" ? undefined : available[0]) ?? undefined;
-	const implied = provider ?? chosen;
+	if (provider !== undefined && !["ddg", "brave", "tavily", "exa", "searxng"].includes(provider)) {
+		throw new Error(`Unknown search provider "${provider}". Choose ddg, brave, tavily, exa, or searxng.`);
+	}
+	if (provider !== undefined && !available.includes(provider)) {
+		throw new Error(`Search provider "${provider}" is not configured. Available: ${available.join(", ")}.`);
+	}
 	const run = (name: string): Promise<SearchResult[]> => {
 		switch (name) {
 			case "brave":
@@ -236,18 +298,22 @@ async function runSearch(
 				return ddgSearch(query, count, signal);
 		}
 	};
-	const order = [implied, ...available].filter((p, i, a): p is string => !!p && a.indexOf(p) === i);
+	const order = provider !== undefined ? [provider] : available;
 	let lastError: unknown;
+	let firstEmpty: string | undefined;
 	for (const name of order) {
+		signal?.throwIfAborted();
 		try {
-			const results = await run(name);
+			const results = (await run(name)).slice(0, count);
 			if (results.length > 0) return { provider: name, results };
+			firstEmpty ??= name;
 		} catch (error) {
+			signal?.throwIfAborted();
 			lastError = error;
 		}
 	}
-	if (lastError) throw lastError;
-	return { provider: order[0] ?? "ddg", results: [] };
+	if (firstEmpty) return { provider: firstEmpty, results: [] };
+	throw lastError;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,20 +321,36 @@ async function runSearch(
 // ---------------------------------------------------------------------------
 
 function htmlToMarkdown(html: string): string {
-	let text = html
-		.replace(/<script[\s\S]*?<\/script>/gi, "")
-		.replace(/<style[\s\S]*?<\/style>/gi, "")
-		.replace(/<noscript[\s\S]*?<\/noscript>/gi, "")
-		.replace(/<svg[\s\S]*?<\/svg>/gi, "")
-		.replace(/<head[\s\S]*?<\/head>/gi, "")
+	const clean = html
+		.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+		.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "")
+		.replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, "")
+		.replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, "")
+		.replace(/<head\b[^>]*>[\s\S]*?<\/head>/gi, "")
 		.replace(/<!--[\s\S]*?-->/g, "");
+	const parts: string[] = [];
+	let start = 0;
+	for (const match of clean.matchAll(/<pre\b[^>]*>([\s\S]*?)<\/pre>/gi)) {
+		const index = match.index ?? 0;
+		parts.push(proseToMarkdown(clean.slice(start, index)));
+		const code = decodeEntities(match[1].replace(/<[^>]+>/g, "")).replace(/\r\n?/g, "\n");
+		let fenceLength = 3;
+		for (const run of code.matchAll(/`+/g)) fenceLength = Math.max(fenceLength, run[0].length + 1);
+		const fence = "`".repeat(fenceLength);
+		parts.push(fence + "\n" + code + (code.endsWith("\n") ? "" : "\n") + fence);
+		start = index + match[0].length;
+	}
+	parts.push(proseToMarkdown(clean.slice(start)));
+	return parts.filter(Boolean).join("\n\n");
+}
 
-	text = text.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_m, body) => `\n\`\`\`\n${stripTags(body)}\n\`\`\`\n`);
+function proseToMarkdown(html: string): string {
+	let text = html;
 	text = text.replace(
 		/<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi,
 		(_m, href, label) => {
 			const l = stripTags(label);
-			return l && href ? `[${l}](${href.startsWith("#") ? href : href})` : l;
+			return l && href ? `[${l}](${href})` : l;
 		},
 	);
 	text = text.replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_m, level, body) => `\n${"#".repeat(Number(level))} ${stripTags(body)}\n`);
@@ -312,7 +394,7 @@ export default function webExtension(pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_id, params, signal) {
-			const count = Math.min(Math.max(params.max_results ?? 8, 1), 20);
+			const count = Math.min(Math.max(Math.floor(params.max_results ?? 8), 1), 20);
 			const { provider, results } = await runSearch(params.query, count, params.provider, signal);
 			if (results.length === 0) {
 				return {
@@ -344,7 +426,7 @@ export default function webExtension(pi: ExtensionAPI) {
 		parameters: Type.Object({
 			url: Type.String({ description: "Absolute http(s) URL to fetch" }),
 			max_chars: Type.Optional(
-				Type.Number({ description: "Maximum characters to return (default 40000)" }),
+				Type.Integer({ minimum: 1, description: "Maximum characters to return (default 40000)" }),
 			),
 		}),
 		async execute(_id, params, signal) {
@@ -370,13 +452,14 @@ export default function webExtension(pi: ExtensionAPI) {
 				signal,
 			);
 			const contentType = res.headers.get("content-type") ?? "";
-			const raw = await res.text();
+			const { bytes, truncated: bodyTruncated } = await readBoundedBody(res, FETCH_MAX_BYTES);
+			const raw = decodeBody(bytes, contentType);
 			let body: string;
 			let kind: string;
 			if (contentType.includes("application/json") || /^\s*[[{]/.test(raw.slice(0, 200))) {
 				kind = "json";
 				try {
-					body = JSON.stringify(JSON.parse(raw), null, 2);
+					body = bodyTruncated ? raw : JSON.stringify(JSON.parse(raw), null, 2);
 				} catch {
 					body = raw;
 				}
@@ -388,10 +471,12 @@ export default function webExtension(pi: ExtensionAPI) {
 				body = raw;
 			}
 			const { text, truncated } = truncate(body, params.max_chars ?? 40000);
-			const header = `# ${url.toString()}\nHTTP ${res.status} ${res.statusText} · ${kind}${truncated ? " · truncated" : ""}\n\n`;
+			const finalUrl = res.url || url.toString();
+			const bodyNote = bodyTruncated ? ` · body exceeded ${FETCH_MAX_BYTES / 1024 / 1024} MiB` : "";
+			const header = `# ${finalUrl}\nHTTP ${res.status} ${res.statusText} · ${kind}${truncated ? " · output truncated" : ""}${bodyNote}\n\n`;
 			return {
 				content: [{ type: "text", text: header + text }],
-				details: { url: url.toString(), status: res.status, contentType, kind, truncated },
+				details: { url: finalUrl, status: res.status, contentType, kind, truncated: truncated || bodyTruncated, bodyTruncated },
 			};
 		},
 	});

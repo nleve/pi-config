@@ -1,9 +1,16 @@
 {
-  "lastChangelogVersion": "1.0.0",
+  "lastChangelogVersion": "1.5.2",
   "defaultProvider": "opencode-go",
   "defaultModel": "deepseek-v4.1-flash",
   "tuiMode": "fullscreen",
   "defaultTools": [
     "+codemode"
-  ]
+  ],
+  "hideThinkingBlock": false,
+  "compaction": {
+    "enabled": true
+  },
+  "enableInstallTelemetry": false,
+  "fullscreenScrollbar": "auto",
+  "theme": "system"
 }

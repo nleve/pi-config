@@ -312,8 +312,13 @@ durable identity possible at all.
 - `^<selector>[:<level>]` — declare a *new* delegate spec (model + thinking).
   Resolved against the session model catalogue, persisted branch-locally, and
   compiled by the `herdr` tool to `--model <provider>/<id> [--thinking <level>]`.
-- `^^<name>` — address an *existing* worker instance. (`@` is already pi's file
-  reference sigil, so the second caret is the instance sigil.)
+- `^^<name>` — address a named worker. The picker labels live workers separately
+  from dormant, IRC-only workers. Mail to a dormant worker waits for it to run
+  again; it does not wake it. (`@` is already Pi's file reference sigil.)
+- Resolved mentions are highlighted inline in the composer and transcript.
+  The underlying prompt and caret syntax stay editable, and model-facing
+  routing details don't appear in the transcript. Starting a worker shows
+  `Started ^^name`; parking mail for an offline worker shows `Queued for ^^name`.
 
 **Build order (each slice useful alone):**
 1. **Pi-only + model/thinking + `^` delegates** — *in progress*
@@ -325,8 +330,10 @@ durable identity possible at all.
    - [x] Auto-generated worker codenames (`names.ts`) when `name` is omitted
    - [x] `^` / `^^` autocomplete (`ctx.ui.addAutocompleteProvider`): `^` suggests
          the model catalogue, `^^` suggests live registry names
-   - [x] `^^name` in prompt text expands to a resolved-pane legend (was only a
-         reserved sigil before)
+   - [x] `^model:` autocomplete suggests supported thinking levels; literal
+         model IDs with colons remain selectable
+   - [x] `^^name` expands to a live pane or a dormant IRC-only destination;
+         recognized mentions are styled in place, not followed by a receipt
 2. **Name registry** — 🚧 started
    - [x] `registry.ts`: per-pane identity files written by every pi (so an agent
          the human started directly is included), dead-pid pruning

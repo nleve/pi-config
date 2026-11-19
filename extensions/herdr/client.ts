@@ -106,6 +106,10 @@ export function unwrapHerdr(stdout: string): unknown {
 	return parsed;
 }
 
+export class HerdrCommandError extends Error {
+	constructor(message: string, readonly code?: string) { super(message); }
+}
+
 export interface HerdrCall {
 	args: string[];
 	timeoutMs?: number;
@@ -119,14 +123,14 @@ export async function callHerdr(
 	const run = await runHerdr(call.args, signal, call.timeoutMs);
 	const combined = [run.stdout.trim(), run.stderr.trim()].filter(Boolean).join("\n");
 	if (run.code !== 0) {
-		// herdr writes an error envelope to stdout on API failures (exit != 0),
-		// so try to unwrap a useful message before falling back to raw output.
-		try {
-			unwrapHerdr(run.stdout);
-		} catch (error) {
-			throw new Error(error instanceof Error ? error.message : String(error));
+		for (const stream of [run.stdout, run.stderr]) {
+			let response: Envelope | undefined;
+			try { response = JSON.parse(stream.trim()) as Envelope; } catch { continue; }
+			const error = response?.error;
+			if (error && typeof error === "object") throw new HerdrCommandError(error.message || error.code || "Herdr rejected the request.", error.code);
+			if (typeof error === "string") throw new HerdrCommandError(error);
 		}
-		throw new Error(`herdr ${call.args.join(" ")} exited ${run.code}:\n${combined || "(no output)"}`);
+		throw new HerdrCommandError(`herdr ${call.args.slice(0, 2).join(" ")} exited ${run.code}:\n${combined || "(no output)"}`);
 	}
 	return { result: unwrapHerdr(run.stdout), run };
 }

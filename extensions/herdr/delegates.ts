@@ -132,18 +132,19 @@ export function parseSelectorLevel(
 		const level = token.slice(idx + 1);
 		if (isThinkingLevel(level)) {
 			const model = resolveModelRef(models, token.slice(0, idx));
-			if (model) return { model, level };
+			if (model && supportedLevels(model).includes(level)) return { model, level };
 		}
 	}
 	return undefined;
 }
 
-/** Thinking levels a model advertises. `off` is always available. */
+/** Match Pi's supported levels: extended levels must be explicitly advertised. */
 export function supportedLevels(model: ModelLike): ThinkingLevel[] {
 	if (!model.reasoning) return ["off"];
-	const map = model.thinkingLevelMap;
-	if (!map) return [...THINKING_LEVELS];
-	return THINKING_LEVELS.filter((level) => map[level] !== null);
+	return THINKING_LEVELS.filter((level) => {
+		const mapped = model.thinkingLevelMap?.[level];
+		return mapped !== null && ((level !== "xhigh" && level !== "max") || mapped !== undefined);
+	});
 }
 
 function selectorOf(model: ModelLike): string {
@@ -158,7 +159,7 @@ function formatLegend(delegates: readonly Delegate[], models: readonly ModelLike
 		return `  ^${d.token} → ${d.selector} · ${thinking}${levels}`;
 	});
 	return [
-		"Delegates requested (spawn a herdr worker with `model:` set to the token):",
+		"Delegates requested (use the `delegate` tool with `model` set to the token):",
 		...lines,
 	].join("\n");
 }
@@ -214,7 +215,7 @@ export class DelegateRegistry {
 	 * at least one delegate is found, the returned text carries a legend so the
 	 * model knows what each token means and how to spawn it.
 	 */
-	expand(text: string): { text: string; delegates: Delegate[] } {
+	expand(text: string): { text: string; delegates: Delegate[]; legend?: string } {
 		if (!text.includes("^")) return { text, delegates: [] };
 		const models = this.#host.availableModels();
 		const found: Delegate[] = [];
@@ -244,7 +245,8 @@ export class DelegateRegistry {
 			}
 		}
 		if (found.length === 0) return { text, delegates: [] };
-		return { text: `${text}\n\n${formatLegend(found, models)}`, delegates: found };
+		const legend = formatLegend(found, models);
+		return { text: `${text}\n\n${legend}`, delegates: found, legend };
 	}
 
 	/**

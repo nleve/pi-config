@@ -7,8 +7,9 @@ pi-irc-seen/
 snapcompact/blobs/
 snapcompact/.last-gc
 
-# Downloaded binaries (re-fetched on demand).
+# Downloaded binaries and managed Pi releases.
 bin/
+/install/
 
 # OS / editor noise.
 .DS_Store

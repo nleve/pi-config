@@ -41,7 +41,7 @@ check("ambiguous bare id rejected", resolveModelRef([...MODELS, { id: "gpt-5", n
 check("parse selector:level", parseSelectorLevel("gpt-5:high", MODELS)?.level === "high");
 check("parse id with colon (no level)", parseSelectorLevel("foo:exacto", MODELS)?.model.id === "foo:exacto");
 check("unknown returns undefined", parseSelectorLevel("nope", MODELS) === undefined);
-check("supported levels: reasoning", supportedLevels(MODELS[0]!).join("|") === "off|minimal|low|medium|high|max");
+check("supported levels: reasoning", supportedLevels(MODELS[0]!).join("|") === "off|minimal|low|medium|high");
 check("supported levels: no reasoning -> off", supportedLevels(MODELS[2]!).join("|") === "off");
 
 // ---- registry -------------------------------------------------------------
@@ -71,8 +71,9 @@ check("unknown token stays literal", r.delegates.length === 0 && r.text === "her
 r = reg.expand("ping ^^otter about it");
 check("^^ instance ref is not a delegate", r.delegates.length === 0);
 
-r = reg.expand("mixed ^gpt-5 and ^llama-3:high");
+r = reg.expand("mixed ^gpt-5 and ^llama-3:off");
 check("multiple delegates", r.delegates.length === 2);
+check("unsupported thinking level stays literal", reg.expand("^llama-3:high").delegates.length === 0);
 
 // ---- resolveModelArgs -----------------------------------------------------
 

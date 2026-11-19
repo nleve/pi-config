@@ -153,25 +153,13 @@ E.stop();
 // broadcast is not workspace-scoped: it unions live peers with durable registry
 // identities, so other-workspace live agents and dormant agents (no live pane)
 // are not silently skipped, while the sender is
-const bt = broadcastTargets(
-	[
-		{ pane_id: "tst:pB", identity: "bob", mailboxKey: "sessB" },
-		{ pane_id: "tst:pA", identity: "alice", self: true },
-	],
-	[
-		{ pane_id: "tst:pB", name: "bob", session_id: "sessB", pid: process.pid },
-		{ pane_id: "w9:pZ", name: "zoe", session_id: "sessZ", pid: 0 },
-		{ pane_id: "tst:pA", name: "alice", session_id: "sessA", pid: process.pid },
-	],
-	"tst:pA",
-);
-check(
-	"broadcast unions live + dormant, skips self",
-	bt.map((t) => t.mailboxKey).join(",") === "sessB,sessZ",
-	JSON.stringify(bt),
-);
-check("live durable keeps its pane for the doorbell", bt[0]?.paneId === "tst:pB");
-check("dormant durable is mailbox-only", bt[1]?.paneId === undefined && bt[1]?.identity === "zoe");
+const bt = broadcastTargets([
+	{ pane_id: "tst:pB", identity: "bob", mailboxKey: "sessB" },
+	{ pane_id: "tst:pB", identity: "bob", mailboxKey: "sessB" },
+	{ pane_id: "tst:pA", identity: "alice", mailboxKey: "sessA", self: true },
+], "tst:pA");
+check("broadcast deduplicates the live roster and skips self", bt.length === 1 && bt[0]?.mailboxKey === "sessB");
+check("live broadcast keeps its pane for the doorbell", bt[0]?.paneId === "tst:pB");
 
 // a duplicate retry must still ring the doorbell (a live recipient is re-nudged)
 const fakePane = "tst:pFake";

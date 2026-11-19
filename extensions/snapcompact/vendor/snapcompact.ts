@@ -2080,20 +2080,85 @@ function planArchive(text: string, high: Shape, low: Shape, maxFrames: number): 
  * reasoning into their kept source; replaying it to Claude trips the
  * `reasoning_extraction` classifier (issue #6093). Re-compaction re-renders the
  * whole unfolded source, so scrubbing the prior text heals a poisoned session
- * at its next compaction. Conservative by construction: only sections that
- * start with `¶think:` at a section boundary are dropped.
+ * at its next compaction. As in OMP, continuation lines belong to their
+ * current scope, and labels inside dimmed tool output don't start a scope.
  */
 function stripThinkingSections(text: string): string {
-	return text
-		.split(NEWLINE_GLYPH)
-		.map(segment =>
-			segment
-				.split(/\n\n(?=¶(?:user|think|ai|call):)/)
-				.filter(section => !section.startsWith("¶think:"))
-				.join("\n\n"),
-		)
-		.filter(segment => segment.length > 0)
-		.join(NEWLINE_GLYPH);
+	const sections: string[] = [];
+	let dimOpen = false;
+	for (const piece of text.split(ARCHIVE_SECTION_START)) {
+		if (dimOpen) sections[sections.length - 1] += piece;
+		else sections.push(piece);
+		const on = piece.lastIndexOf(DIM_ON);
+		const off = piece.lastIndexOf(DIM_OFF);
+		if (on !== off) dimOpen = on > off;
+	}
+	const kept = sections.filter(section => !section.startsWith("¶think:"));
+	if (kept.length === sections.length) return text;
+	const stripped = kept.join("");
+	return sections.at(-1)?.startsWith("¶think:") ? stripped.replace(/[\n█]+$/, "") : stripped;
+}
+
+const ARCHIVE_SECTION_START = /(?<=^|[\n█])(?=¶(?:user|think|ai|call):)/;
+
+/**
+ * Adapted from OMP's viewWithoutFrames (6570133afd through 1a3871f4fd).
+ * Give a reader the kept source as text instead of its images, re-rendering
+ * the reading guide and keeping both chronological ends if space is tight.
+ * This is a request-time view only; the persisted archive is unchanged.
+ */
+export function viewWithoutFrames(
+	summary: string,
+	archive: Archive,
+	maxChars: number,
+	includeThinking: boolean,
+): { summary: string; archive: Archive } {
+	const scrub = (text: string): string => includeThinking ? text : stripThinkingSections(text);
+	const tail = archive.text ? "" : (archive.textTail ?? "");
+	// A legacy tail may start mid-thought; without the full source we cannot
+	// infer its opening scope. Start at the first explicitly labelled section.
+	const tailStart = !includeThinking && tail ? tail.search(ARCHIVE_SECTION_START) : 0;
+	const safeTail = tailStart === -1 ? "" : tail.slice(tailStart);
+	let head = elideDataUrls(toPlainText(scrub(archive.text ?? archive.textHead ?? "")), "archive");
+	let end = elideDataUrls(toPlainText(scrub(safeTail)), "archive");
+	const sourceChars = head.length + end.length;
+	maxChars = Math.max(0, Math.floor(maxChars));
+	if (sourceChars > maxChars) {
+		const headChars = Math.min(head.length, Math.max(Math.ceil(maxChars / 2), maxChars - (end.length || head.length)));
+		const tailChars = maxChars - headChars;
+		end = tailChars > 0 ? (end || head).slice(-tailChars) : "";
+		head = head.slice(0, headChars);
+	}
+	const truncatedChars = archive.truncatedChars + sourceChars - head.length - end.length +
+		(archive.text ? 0 : archive.frames.reduce((sum, frame) => sum + frame.chars, 0) + tail.length - safeTail.length);
+	const historyTitle = "HISTORY\n===================";
+	const filesTitle = "FILES\n===================\n";
+	const filesStart = summary.indexOf(filesTitle);
+	const historyStart = summary.lastIndexOf(historyTitle);
+	const templateSummary = summary.startsWith("Resume prior conversation.") && summary.trimEnd().endsWith(historyTitle);
+	const files = templateSummary && filesStart >= 0 && historyStart > filesStart
+		? summary.slice(filesStart + filesTitle.length, historyStart).trimEnd()
+		: undefined;
+	const guide = prompt.render(snapcompactSummaryPrompt, {
+		frameCount: 0,
+		truncatedChars,
+		includedPreviousSummary: head.startsWith("[Summary of earlier history]"),
+		files,
+		includeThinking: includeThinking && summary.includes("`¶think:`"),
+	});
+	const original = templateSummary ? "" : (includeThinking
+		? summary
+		: scrub(summary).replace(/`¶user:`, `¶think:`, (`¶ai:`, (?:and )?`¶call:`:? (?:open )?user, )assistant reasoning, /g, "`¶user:`, $1")).trim();
+	return {
+		summary: original ? `${original}\n\n${guide}` : guide,
+		archive: {
+			frames: [],
+			totalChars: head.length + end.length,
+			truncatedChars,
+			...(head ? { textHead: head } : {}),
+			...(end ? { textTail: end } : {}),
+		},
+	};
 }
 
 /**

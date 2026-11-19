@@ -7,9 +7,8 @@
  * text that a vision model reads back directly. The pass is local and
  * deterministic: no LLM call, no API key, no latency beyond rendering.
  *
- * Engine: `vendor/snapcompact.ts` is omp's source verbatim (import shims only),
- * so frame shape selection, foveation, the reading-guide summary, carry-forward
- * and thinking-healing are identical.
+ * Engine: `vendor/snapcompact.ts` is a vendored OMP snapshot with import shims
+ * and a bounded text-only archive view ported from later upstream versions.
  *
  * Integration (the parts omp supplies natively, reimplemented here):
  *   - `session_before_compact` renders the archive, sizes it with a
@@ -48,13 +47,14 @@ import {
 	resolveShape,
 	resolveShapeForText,
 	SHAPE_VARIANT_NAMES,
+	viewWithoutFrames,
 	type Archive,
 	type Shape,
 	type ShapeVariantName,
 } from "./vendor/snapcompact";
 import { preferredDialect } from "./vendor/identity";
 import { blobStats, externalizeArchive, formatBytes, gcBlobs, maybeAutoGc, resolveFrameData, resolvedFrameBytes } from "./blobs";
-import { archiveTokens, computeMaxFrames, guardReduction, tokensOfMessages } from "./budget";
+import { archiveTokens, computeMaxFrames, guardReduction, textArchiveCharBudget, tokensOfMessages } from "./budget";
 import { resolveFrameCountBudget, resolveImageCountBudget } from "./tuning";
 import { type FrameCacheEntry, imageToolResults } from "./inline";
 
@@ -249,14 +249,14 @@ function resolveCompactionShape(
 	return resolveShapeForText(probe, model as never, config.shape);
 }
 
-/** Keep only the newest `limit` frames; count the dropped ones as truncated. */
+/** Keep only the newest `limit` frames; count the dropped characters. */
 function clampArchiveFrames(archive: Archive, limit: number): Archive {
-	if (archive.frames.length <= limit) return archive;
-	const dropped = archive.frames.slice(0, archive.frames.length - limit);
+	const omit = archive.frames.length - limit;
+	if (omit <= 0) return archive;
 	return {
 		...archive,
-		frames: archive.frames.slice(-limit),
-		truncatedChars: (archive.truncatedChars ?? 0) + dropped.length,
+		frames: archive.frames.slice(omit),
+		truncatedChars: archive.truncatedChars + archive.frames.slice(0, omit).reduce((sum, frame) => sum + frame.chars, 0),
 	};
 }
 
@@ -279,7 +279,7 @@ function shapeLabel(shape: Shape): string {
 }
 
 /** Render an archive into pi content blocks (text edges + frame images). */
-function archiveBlocks(archive: Archive): unknown[] {
+function archiveBlocks(archive: Archive) {
 	if (archive.frames.length === 0 && !archive.textHead && !archive.textTail) return [];
 	return historyBlocks(archive, {
 		maxFrameDataBytes: FRAME_DATA_BYTES_BUDGET,
@@ -290,8 +290,8 @@ function archiveBlocks(archive: Archive): unknown[] {
 }
 
 export default function snapcompactExtension(pi: ExtensionAPI): void {
-	// Rebuild the frame payload once per compaction summary, not once per request.
-	const archiveCache = new Map<string, unknown[]>();
+	// Keep one decoded frame payload, keyed by session, compaction and limit.
+	let archiveCache: { key: string; blocks: ReturnType<typeof archiveBlocks> } | undefined;
 	// Rendered inline tool-result frames, keyed by toolCallId.
 	const toolFrameCache = new Map<string, FrameCacheEntry>();
 
@@ -459,56 +459,49 @@ export default function snapcompactExtension(pi: ExtensionAPI): void {
 		let messages = event.messages as unknown[];
 		let changed = false;
 
-		// 1. Re-attach the active compaction's frames to its summary message.
-		if (messages.some(message => (message as { role?: unknown }).role === "compactionSummary")) {
-			const archives = new Map<string, Archive>();
-			for (const entry of ctx.sessionManager.getBranch()) {
-				if (entry.type !== "compaction") continue;
+		// Pi's session context has one active compaction summary. Ignore older
+		// entries (including a snapcompact followed by a soft compaction).
+		const summaryIndex = event.messages.findIndex(message => message.role === "compactionSummary");
+		if (summaryIndex >= 0) {
+			const message = event.messages[summaryIndex];
+			const entry = ctx.sessionManager.getBranch().findLast(item => item.type === "compaction");
+			if (message.role === "compactionSummary" && entry?.type === "compaction" && entry.summary === message.summary) {
 				const archive = getPreservedArchive(entry.details as Record<string, unknown> | undefined);
-				if (archive) archives.set(entry.summary, archive);
-			}
-			if (archives.size > 0) {
-				let attachedFrames = 0;
-				messages = messages.map(message => {
-					const summaryMessage = message as { role?: unknown; summary?: string; timestamp?: number };
-					if (summaryMessage.role !== "compactionSummary") return message;
-					const archive = archives.get(summaryMessage.summary as string);
-					if (!archive) return message;
-
-					// Bound the archive to what this request's provider allows, and
-					// drop frames entirely on a model that cannot accept images.
-					const limitedBase = clampArchiveFrames(archive, Math.max(1, imageBudget - countImages(messages)));
-					const limited = vision ? limitedBase : { ...limitedBase, frames: [] as typeof limitedBase.frames };
-
-					const cacheKey = `${summaryMessage.summary as string}|${limited.frames.length}`;
-					let blocks = archiveCache.get(cacheKey);
-					if (!blocks) {
-						blocks = archiveBlocks(limited);
-						archiveCache.set(cacheKey, blocks);
+				if (archive) {
+					const limit = vision ? Math.max(0, imageBudget - countImages(messages)) : 0;
+					let summary = message.summary;
+					let blocks: ReturnType<typeof archiveBlocks> = [];
+					if (limit > 0 && archive.frames.length > 0) {
+						const key = JSON.stringify([ctx.sessionManager.getSessionId(), entry.id, Math.min(limit, archive.frames.length)]);
+						blocks = archiveCache?.key === key
+							? archiveCache.blocks
+							: archiveBlocks(clampArchiveFrames(archive, limit));
+						if (blocks.some(block => block.type === "image")) archiveCache = { key, blocks };
 					}
-					if (blocks.length === 0) return message;
-
-					changed = true;
-					attachedFrames += limited.frames.length;
-					return {
-						role: "custom" as const,
+					if (!blocks.some(block => block.type === "image")) {
+						const retainedTokens = tokensOfMessages(messages) + Math.ceil(ctx.getSystemPrompt().length / 4);
+						const view = viewWithoutFrames(
+							summary,
+							archive,
+							textArchiveCharBudget(model?.contextWindow, retainedTokens),
+							includeThinkingFor(model?.id),
+						);
+						summary = view.summary;
+						blocks = archiveBlocks(view.archive);
+					}
+					messages = messages.slice();
+					messages[summaryIndex] = {
+						role: "custom",
 						customType: "snapcompact",
 						display: false,
-						timestamp: summaryMessage.timestamp,
+						timestamp: message.timestamp,
 						content: [
-							{
-								type: "text" as const,
-								text:
-									COMPACTION_SUMMARY_PREFIX +
-									(summaryMessage.summary as string) +
-									COMPACTION_SUMMARY_SUFFIX,
-							},
+							{ type: "text", text: COMPACTION_SUMMARY_PREFIX + summary + COMPACTION_SUMMARY_SUFFIX },
 							...blocks,
 						],
 					};
-				});
-				// Keep the count honest for the inline pass below.
-				if (attachedFrames > 0 && !changed) changed = true;
+					changed = true;
+				}
 			}
 		}
 

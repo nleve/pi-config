@@ -38,6 +38,20 @@ export function tokensOfMessages(messages: readonly unknown[]): number {
 	return sum;
 }
 
+/**
+ * OMP's bounded text-reader view, using Pi's window and current retained
+ * messages rather than the previous turn's provider usage. Leave room for
+ * tool schemas, generation and the reading guide. Use a conservative
+ * chars/token ratio, and don't let the fallback dominate a large window.
+ */
+export function textArchiveCharBudget(contextWindow: number | undefined, retainedTokens: number): number {
+	const window = contextWindow ?? 0;
+	if (window <= 0) return 32_000;
+	const reserve = Math.min(DEFAULT_COMPACTION_SETTINGS.reserveTokens, Math.ceil(window / 4));
+	const headroom = window - reserve - retainedTokens - SUMMARY_TEMPLATE_TOKENS;
+	return Math.max(0, Math.min(headroom, Math.floor(window / 4), 64_000) * 2);
+}
+
 export interface MaxFramesInput {
 	model: BudgetTarget & { contextWindow?: number };
 	shape: Shape;
