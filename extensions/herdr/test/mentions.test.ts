@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { DelegateRegistry, type ModelLike } from "../delegates.ts";
 import { registerIrcTool, type IrcNode } from "../irc.ts";
-import { CURSOR_MARKER, renderFakeCursor, visibleWidth } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, renderFakeCursor, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { highlightMentionRow } from "../mention-editor.ts";
 import { appendMentionRouting, draftMentions, modelMentionItems, renderMentionMessage, workerMentionItems } from "../mentions.ts";
 
@@ -46,6 +46,21 @@ test("inline transcript styling is render-only and uses the resolution at submit
 	expect(renderMentionMessage("plain ^unknown and ^^ghost")).toBe("plain ^unknown and ^^ghost");
 });
 
+test("duplicate titles match completion but preserve exact handles and submitted title snapshots", () => {
+	const titled = [
+		{ name: "brisk-otter", title: "Token Renewal Audit", pane: "w1:p3" },
+		{ name: "lunar-dune", title: "Token Renewal Audit", pane: "w1:p2" },
+	];
+	const choices = workerMentionItems(titled, "renewal");
+	expect(choices.map(item => item.value)).toEqual(["^^brisk-otter", "^^lunar-dune"]);
+	expect(choices[1]).toMatchObject({ label: "Token Renewal Audit", description: "^^lunar-dune · live · w1:p2" });
+	expect(workerMentionItems(titled, "lunar")[0]?.value).toBe("^^lunar-dune");
+	const routed = appendMentionRouting("Ask ^^lunar-dune about the next step.", undefined, titled);
+	titled[1]!.title = "New title";
+	expect(routed).toContain("Ask ^^lunar-dune");
+	expect(renderMentionMessage(routed)).toBe("Ask `Token Renewal Audit` about the next step.");
+});
+
 test("draft resolves only real mentions, without persisting or styling shell input", () => {
 	const registry = new DelegateRegistry({ availableModels: () => models, persist() { throw Error("draft persisted"); } });
 	const resolve = (text: string) => [...draftMentions(text, models, registry, () => workers)];
@@ -67,6 +82,21 @@ test("editor styling preserves terminal width and Pi's cursor markers", () => {
 	expect(rendered).toContain(CURSOR_MARKER + renderFakeCursor("^"));
 	expect(rendered.replace(/\x1b\[(?:36|39)m/g, "")).toBe(row);
 	expect(visibleWidth(rendered)).toBe(visibleWidth(row));
+});
+
+test("composer renders titles without corrupting width or an editable handle", () => {
+	const matches = new Map([["^^lunar-dune", "worker"]] as const);
+	const titles = new Map([["^^lunar-dune", "Token Renewal Audit"]]);
+	const color = (_: string, text: string) => `\x1b[32m${text}\x1b[39m`;
+	const row = "Ask ^^lunar-dune " + CURSOR_MARKER + renderFakeCursor("a") + "bout this           ";
+	const display = highlightMentionRow(row, matches, color, titles);
+	expect(stripTerminalSequences(display).trimEnd()).toBe("Ask Token Renewal Audit about this");
+	expect(visibleWidth(display)).toBe(visibleWidth(row));
+	expect(display).toContain(CURSOR_MARKER + renderFakeCursor("a"));
+	const editing = "Ask ^" + CURSOR_MARKER + renderFakeCursor("^") + "lunar-dune                 ";
+	expect(stripTerminalSequences(highlightMentionRow(editing, matches, color, titles))).toBe(stripTerminalSequences(editing));
+	const narrow = "Ask ^^lunar-dune today";
+	expect(visibleWidth(highlightMentionRow(narrow, matches, color, titles))).toBe(visibleWidth(narrow));
 });
 
 test("IRC broadcast requires an explicit target and uses only the scoped live roster", async () => {

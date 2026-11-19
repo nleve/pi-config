@@ -198,6 +198,7 @@ export interface PanelMetaOptions {
 	stage?: string;
 	project?: string;
 	task?: string;
+	title?: string;
 	parent?: string;
 	source?: string;
 	ttlMs?: number;
@@ -209,7 +210,7 @@ export interface PanelMetaOptions {
  * an ungrouped one keeps the project/name title.
  */
 export function panelMetadataArgs(paneId: string, name: string, opts: PanelMetaOptions = {}): string[] {
-	const title = opts.task ?? (opts.group ? `${opts.group}${opts.stage ? `/${opts.stage}` : ""}` : opts.project || name);
+	const title = opts.title ?? opts.task ?? (opts.group ? `${opts.group}${opts.stage ? `/${opts.stage}` : ""}` : opts.project || name);
 	const args = [
 		"pane",
 		"report-metadata",
@@ -224,7 +225,10 @@ export function panelMetadataArgs(paneId: string, name: string, opts: PanelMetaO
 		name,
 	];
 	if (opts.project !== undefined) args.push("--token", `project=${opts.project}`);
-	if (opts.task) args.push("--token", `task=${opts.task}`);
+	if (opts.task || opts.title) args.push("--token", `task=${opts.task ?? opts.title}`);
+	if (opts.title) args.push("--token", `session_title=${opts.title}`);
+	else args.push("--clear-token", "session_title");
+	if (!opts.task && !opts.title) args.push("--clear-token", "task");
 	if (opts.parent) args.push("--token", `parent=${opts.parent}`);
 	if (opts.group) args.push("--token", `group=${opts.group}`);
 	if (opts.stage) args.push("--token", `stage=${opts.stage}`);

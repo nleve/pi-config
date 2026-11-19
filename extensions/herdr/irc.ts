@@ -32,6 +32,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { enqueue, envelopeKey, listPending, removeMessage, sweepMailboxes } from "./mailbox.ts";
 import { workerHandle } from "./mentions.ts";
+import { cleanTitle } from "./session-title.ts";
 
 export type IrcScope = "self" | "tab" | "workspace" | "all";
 /** Delivery mode while the recipient is busy. `reject` is intentionally gone. */
@@ -40,7 +41,10 @@ export type IrcAckStatus = "mailboxed" | "duplicate";
 
 export interface IrcEnvelope {
 	id: string;
+	/** Stable sender identity used for routing and wait filters. */
 	from: string;
+	/** Optional display title at send time; never used as an address. */
+	fromTitle?: string;
 	to: string;
 	body: string;
 	ts: number;
@@ -105,6 +109,10 @@ export function broadcastTargets(peers: readonly IrcPeer[], selfPane: string): I
 }
 
 const LOG_CAP = 200;
+// Allow a sequential send → wait to claim a fast reply before Pi queues it
+// as a follow-up. The mailbox file remains durable during that short grace.
+const REPLY_GRACE_MS = 10_000;
+const EXPECT_REPLY_MS = 120_000;
 const DOORBELL_TIMEOUT_MS = 2000;
 /** Stale `.seen` files (an identity that has not received in this long) are reaped. */
 const SEEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -170,7 +178,9 @@ export async function ringDoorbell(paneId: string, timeoutMs: number = DOORBELL_
 
 interface Waiter {
 	from?: string;
+	replyTo?: string;
 	done: boolean;
+	cleanup?: () => void;
 	timer: ReturnType<typeof setTimeout>;
 	resolve: (env: IrcEnvelope | undefined) => void;
 }
@@ -180,6 +190,8 @@ export interface IrcNodeOptions {
 	/** Durable identity. The mailbox is keyed by this when present. */
 	sessionId?: string;
 	identity?: string;
+	/** Read the sender's current display title when a message is sent. */
+	getTitle?: () => string | undefined;
 	/** Mailbox key; defaults to `sessionId ?? paneId`. */
 	mailboxKey?: string;
 	/** Inject a message into the live session. Fire-and-forget. */
@@ -196,6 +208,9 @@ export class IrcNode {
 	private server?: net.Server;
 	private healTimer?: ReturnType<typeof setInterval>;
 	private waiters: Waiter[] = [];
+	private expected = new Map<string, number>();
+	private held = new Map<string, { request: string; until: number }>();
+	private releaseTimer?: ReturnType<typeof setTimeout>;
 	private log: IrcEnvelope[] = [];
 	private started = false;
 	/** Bounded, persisted dedup ring of processed `dedupeId ?? id`. */
@@ -264,11 +279,8 @@ export class IrcNode {
 	stop(): void {
 		if (this.healTimer) clearInterval(this.healTimer);
 		this.healTimer = undefined;
-		for (const w of this.waiters) {
-			clearTimeout(w.timer);
-			w.resolve(undefined);
-		}
-		this.waiters = [];
+		for (const w of [...this.waiters]) this.settleWaiter(w, undefined);
+		this.clearReplyGrace();
 		this.server?.close();
 		this.server = undefined;
 		this.started = false;
@@ -284,6 +296,21 @@ export class IrcNode {
 		if (identity) this.identity = identity;
 		if (!sessionId || sessionId === this.mailboxKey) return;
 		const fromKey = this.mailboxKey;
+		if (fromKey !== this.paneId) {
+			// Only the provisional pane key belongs to the new session. In
+			// particular, don't forward a held reply into an unrelated session.
+			for (const w of [...this.waiters]) this.settleWaiter(w, undefined);
+			this.clearReplyGrace();
+			this.injected.clear();
+			this.spillover.clear();
+			this.seen.clear();
+			this.seenOrder = [];
+			this.log = [];
+			this.mailboxKey = sessionId;
+			this.loadSeen();
+			void this.drain();
+			return;
+		}
 		// The mailbox key changes from the provisional pane id to the durable
 		// session id. Reattach anything still parked under the old key first, or
 		// unconfirmed pane-keyed mail would be orphaned forever. If any item
@@ -428,13 +455,41 @@ export class IrcNode {
 
 	/** Hand an envelope to a blocked `wait`, if one matches. */
 	private takeWaiter(env: IrcEnvelope): boolean {
-		const i = this.waiters.findIndex((w) => !w.done && (!w.from || w.from === env.from));
-		if (i < 0) return false;
-		const w = this.waiters.splice(i, 1)[0]!;
-		w.done = true;
-		clearTimeout(w.timer);
-		w.resolve(env);
+		const w = this.waiters.find(w => !w.done && (!w.from || w.from === env.from) && (!w.replyTo || w.replyTo === env.replyTo));
+		if (!w) return false;
+		this.settleWaiter(w, env);
 		return true;
+	}
+
+	private clearReplyGrace(): void {
+		clearTimeout(this.releaseTimer);
+		this.releaseTimer = undefined;
+		this.expected.clear();
+		this.held.clear();
+	}
+
+	private deferReply(env: IrcEnvelope, key: string): boolean {
+		if (!env.replyTo) return false;
+		const now = Date.now();
+		const held = this.held.get(key);
+		if (held) {
+			if (held.until > now) return true;
+			this.held.delete(key);
+			this.expected.delete(held.request);
+			return false;
+		}
+		if ((this.expected.get(env.replyTo) ?? 0) <= now) return false;
+		this.held.set(key, { request: env.replyTo, until: now + REPLY_GRACE_MS });
+		return true;
+	}
+
+	private scheduleReplyRelease(): void {
+		clearTimeout(this.releaseTimer);
+		this.releaseTimer = undefined;
+		if (!this.held.size) return;
+		const deadline = Math.min(...Array.from(this.held.values(), h => h.until));
+		this.releaseTimer = setTimeout(() => { void this.drain(); }, Math.max(1, deadline - Date.now()));
+		this.releaseTimer.unref?.();
 	}
 
 	/** Drain the mailbox: deliver, confirm durability, then unlink. Single-flight. */
@@ -444,6 +499,7 @@ export class IrcNode {
 			return;
 		}
 		this.draining = true;
+		const stillHeld = new Set<string>();
 		try {
 			for (const mailbox of [this.mailboxKey, ...this.spillover]) {
 				for (const { key, env } of listPending(mailbox)) {
@@ -457,6 +513,10 @@ export class IrcNode {
 					}
 					if (this.takeWaiter(env)) {
 						this.confirm(key, env);
+						continue;
+					}
+					if (this.deferReply(env, key)) {
+						stillHeld.add(key);
 						continue;
 					}
 					this.injected.set(key, env);
@@ -474,6 +534,8 @@ export class IrcNode {
 			}
 		} finally {
 			this.draining = false;
+			for (const key of this.held.keys()) if (!stillHeld.has(key)) this.held.delete(key);
+			this.scheduleReplyRelease();
 			if (this.dirty) {
 				this.dirty = false;
 				void this.drain();
@@ -498,6 +560,8 @@ export class IrcNode {
 			}
 		}
 		this.injected.delete(key);
+		this.held.delete(key);
+		if (env.replyTo) this.expected.delete(env.replyTo);
 		this.log.push(env);
 		if (this.log.length > LOG_CAP) this.log.shift();
 	}
@@ -508,6 +572,7 @@ export class IrcNode {
 	 * re-injected, then drain again.
 	 */
 	async settle(): Promise<void> {
+		this.clearReplyGrace();
 		for (const [key, env] of [...this.injected]) {
 			if (this.isPersisted(env)) this.confirm(key, env);
 			else this.injected.delete(key);
@@ -515,22 +580,23 @@ export class IrcNode {
 		await this.drain();
 	}
 
-	/** Block for the next message (optionally filtered by sender). */
-	wait(opts: { from?: string; timeoutMs: number; signal?: AbortSignal }): Promise<IrcEnvelope | undefined> {
+	/** Claim the next undelivered match, including replies parked before wait. */
+	wait(opts: { from?: string; replyTo?: string; timeoutMs: number; signal?: AbortSignal }): Promise<IrcEnvelope | undefined> {
+		if (opts.signal?.aborted) return Promise.resolve(undefined);
 		return new Promise((resolve) => {
 			const w: Waiter = {
-				from: opts.from,
+				from: opts.from?.trim().replace(/^\^\^/, ""),
+				replyTo: opts.replyTo,
 				done: false,
 				resolve,
 				timer: setTimeout(() => this.settleWaiter(w, undefined), opts.timeoutMs),
 			};
 			w.timer.unref?.();
-			if (opts.signal?.aborted) {
-				resolve(undefined);
-				return;
-			}
-			opts.signal?.addEventListener("abort", () => this.settleWaiter(w, undefined), { once: true });
+			const onAbort = () => this.settleWaiter(w, undefined);
+			opts.signal?.addEventListener("abort", onAbort, { once: true });
+			w.cleanup = () => opts.signal?.removeEventListener("abort", onAbort);
 			this.waiters.push(w);
+			void this.drain();
 		});
 	}
 
@@ -538,6 +604,7 @@ export class IrcNode {
 		if (w.done) return;
 		w.done = true;
 		clearTimeout(w.timer);
+		w.cleanup?.();
 		const i = this.waiters.indexOf(w);
 		if (i >= 0) this.waiters.splice(i, 1);
 		w.resolve(env);
@@ -552,9 +619,11 @@ export class IrcNode {
 		body: string,
 		opts: { replyTo?: string; mode?: IrcMode; dedupeId?: string; expectsReply?: boolean } = {},
 	): Promise<{ env: IrcEnvelope; ack: IrcAck }> {
+		const title = senderTitle(this.identity, this.opts.getTitle?.());
 		const env: IrcEnvelope = {
 			id: randomUUID(),
 			from: this.identity,
+			...(title ? { fromTitle: title } : {}),
 			to: target.identity ?? target.mailboxKey,
 			body,
 			ts: Date.now(),
@@ -569,6 +638,12 @@ export class IrcNode {
 		// must name the actually-parked envelope, not this fresh id.
 		const parked =
 			result === "duplicate" ? listPending(target.mailboxKey).find((i) => i.key === envelopeKey(env)) : undefined;
+		// Arm before ringing: the recipient can reply before send returns.
+		const sent = parked?.env ?? env;
+		if (sent.expectsReply === true) {
+			this.expected.set(sent.id, Date.now() + EXPECT_REPLY_MS);
+			while (this.expected.size > LOG_CAP) this.expected.delete(this.expected.keys().next().value!);
+		}
 		// Ring before the duplicate early-return: a retry must still nudge a live recipient.
 		if (target.paneId && target.paneId !== this.paneId) await ringDoorbell(target.paneId);
 		if (result === "duplicate") {
@@ -625,7 +700,7 @@ const ircSchema = Type.Object({
 		Type.String({ description: 'send: exact ^^handle, agent name, session ID, or pane ID. Use "all" for a live broadcast in scope.' }),
 	),
 	body: Type.Optional(Type.String({ description: "send: message text" })),
-	replyTo: Type.Optional(Type.String({ description: "send: id of the message being replied to" })),
+	replyTo: Type.Optional(Type.String({ description: "send: ID of the message being replied to; wait: only accept replies to this message ID" })),
 	mode: Type.Optional(ircModeSchema),
 	dedupeId: Type.Optional(
 		Type.String({ description: "send: idempotency key; retries with the same value are dropped (defaults to the envelope id)" }),
@@ -641,7 +716,14 @@ const ircSchema = Type.Object({
 	timeout: Type.Optional(Type.Number({ description: "wait: timeout in milliseconds (default 120000)" })),
 });
 
+function senderTitle(from: string, value: unknown): string | undefined {
+	const title = typeof value === "string" ? cleanTitle(value) : undefined;
+	return title === from || title === workerHandle(from) ? undefined : title;
+}
+
 function formatIrcForModel(env: IrcEnvelope): string {
+	const title = senderTitle(env.from, env.fromTitle);
+	const from = title ? `${title} (${workerHandle(env.from)})` : env.from;
 	const reply = env.replyTo ? ` (reply to ${env.replyTo})` : "";
 	const how = `the irc tool: action=send, to=${env.from}, replyTo=${env.id}`;
 	// Never demand a reply: an unconditional "reply with…" makes two idle agents
@@ -653,7 +735,7 @@ function formatIrcForModel(env: IrcEnvelope): string {
 			: env.expectsReply === false
 				? "No reply is needed."
 				: `If a response is expected, reply via ${how}; otherwise no reply is needed.`;
-	return `[irc] [${env.id}] ${env.from}${reply}:\n${env.body}\n\n${guidance}`;
+	return `[irc] [${env.id}] ${from}${reply}:\n${env.body}\n\n${guidance}`;
 }
 
 export function registerIrcTool(pi: ExtensionAPI, deps: IrcToolDeps): void {
@@ -693,7 +775,7 @@ export function registerIrcTool(pi: ExtensionAPI, deps: IrcToolDeps): void {
 		promptSnippet: "Message other agents (IRC) and wait for replies",
 		promptGuidelines: [
 			"Use `irc` to talk to peer agents: `roster` to see who is reachable, `send` to message one (`to: <name|pane>`) or broadcast (`to: \"all\"`), `wait` to block for the next message.",
-			"Incoming IRC messages are injected into your session automatically (steered mid-turn, or a follow-up when idle); a message is delivered exactly once, so `wait` only returns messages you did not already receive.",
+			"After sending with expectsReply:true, use wait with replyTo set to the sent message ID. Fast replies get a short grace period for wait; messages that wait does not claim are injected normally.",
 			"`send` returns an ack per target (`mailboxed`/`duplicate`/`failed`). A `mailboxed` message is already durable, so do not resend it; only `failed` is worth retrying, and reuse the same `dedupeId`.",
 			"Keep messages short and explicit; include what you need and, when replying, set `replyTo` to the incoming message id.",
 			"Reply only when a response is expected; acknowledgements and FYIs need no reply. A reply must not itself demand a reply, or two idle agents will ping-pong.",
@@ -762,6 +844,7 @@ export function registerIrcTool(pi: ExtensionAPI, deps: IrcToolDeps): void {
 			// wait
 			const env = await node.wait({
 				from: params.from,
+				replyTo: params.replyTo,
 				timeoutMs: params.timeout ?? 120000,
 				signal,
 			});

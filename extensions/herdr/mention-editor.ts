@@ -1,4 +1,4 @@
-import { CURSOR_MARKER, renderFakeCursor } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, renderFakeCursor, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { MentionStyle } from "./mentions.ts";
 
 const [cursorStart, cursorEnd] = renderFakeCursor("\0").split("\0");
@@ -9,6 +9,7 @@ export function highlightMentionRow(
 	row: string,
 	mentions: ReadonlyMap<string, MentionStyle>,
 	style: (kind: MentionStyle, text: string) => string,
+	titles?: ReadonlyMap<string, string>,
 ): string {
 	if (!row.includes("^")) return row;
 	let plain = "";
@@ -26,6 +27,10 @@ export function highlightMentionRow(
 
 	let out = "";
 	let copied = 0;
+	// The editor has already wrapped and padded this row. Use only spare
+	// trailing cells for longer labels; never change its layout or cursor bytes.
+	const padding = / +$/.exec(row)?.[0].length ?? 0;
+	let extra = 0;
 	for (const token of plain.matchAll(/(?:^|\s)(\^\^?[^\s^]+)(?=\s|$)/g)) {
 		const kind = mentions.get(token[1]!);
 		if (!kind) continue;
@@ -38,8 +43,17 @@ export function highlightMentionRow(
 			if (row.slice(0, start).endsWith(CURSOR_MARKER)) start -= CURSOR_MARKER.length;
 		}
 		if (cursorEnd && row.startsWith(cursorEnd, end)) end += cursorEnd.length;
-		out += row.slice(copied, start) + style(kind, row.slice(start, end));
+		const original = row.slice(start, end);
+		const title = titles?.get(token[1]!);
+		let display = original;
+		// Keep the raw handle visible whenever the cursor is editing it.
+		if (title && !original.includes("\x1b")) {
+			const width = visibleWidth(original);
+			display = truncateToWidth(title, width + Math.max(0, padding - extra), "…");
+			extra += visibleWidth(display) - width;
+		}
+		out += row.slice(copied, start) + style(kind, display);
 		copied = end;
 	}
-	return out + row.slice(copied);
+	return out + row.slice(copied, extra > 0 ? row.length - extra : row.length) + (extra < 0 ? " ".repeat(-extra) : "");
 }

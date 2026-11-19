@@ -31,6 +31,7 @@ import { highlightMentionRow } from "./mention-editor.ts";
 import { appendMentionRouting, draftMentions, modelMentionItems, renderMentionMessage, workerHandle, workerMentionItems, type MentionWorker } from "./mentions.ts";
 import { generateName, stageName } from "./names.ts";
 import { registerDelegateTools } from "./delegate-tool.ts";
+import { cleanTitle, registerSessionTitles } from "./session-title.ts";
 import { appendSpawnEntry, readSpawnEntries, registerNavigation } from "./navigation.ts";
 import {
 	aggregateWorkflows,
@@ -1393,7 +1394,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 			const local = live && (id.pane_id.split(":")[0] === process.env.HERDR_WORKSPACE_ID ||
 				(id.session_path && paths.has(id.session_path)));
 			if (exact !== undefined && !local && id.name !== exact) return [];
-			return [{ name: id.name, ...(live ? { pane: id.pane_id } : {}), project: id.task_label ?? projectName(id.cwd) }];
+			return [{ name: id.name, title: cleanTitle(id.title ?? id.task_label), ...(live ? { pane: id.pane_id } : {}), project: projectName(id.cwd) }];
 		});
 	}
 
@@ -1415,8 +1416,11 @@ export default function herdrExtension(pi: ExtensionAPI) {
 				});
 				if (!mentions.size) return lines;
 				const palette = ctx.ui.theme;
+				const titles = new Map((workerSnapshot?.workers ?? []).flatMap(worker =>
+					worker.title ? [[`^^${worker.name}`, worker.title] as const] : [],
+				));
 				return lines.map(line => highlightMentionRow(line, mentions, (kind, text) =>
-					palette.fg(kind === "model" ? "accent" : kind === "worker" ? "success" : "muted", text),
+					palette.fg(kind === "model" ? "accent" : kind === "worker" ? "success" : "muted", text), titles,
 				));
 			};
 			return editor;
@@ -1470,19 +1474,26 @@ export default function herdrExtension(pi: ExtensionAPI) {
 	// directly is as addressable as one we spawned. herdr's CLI omits `name`.
 	const selfPane = process.env.HERDR_PANE_ID;
 
+	let activeSessionId: string | undefined;
+	let activeHandle: string | undefined;
+	let previousHandle: string | undefined;
+	let legacyUntitled: string | undefined;
+
 	function ownName(): string {
-		const sessionName = pi.getSessionName()?.trim();
-		if (sessionName) return sessionName;
+		if (activeHandle) return activeHandle;
 		const known = readIdentities();
-		const prior = selfPane ? identityForPane(selfPane)?.name : undefined;
-		if (prior) return prior;
-		const fresh = generateName(new Set(known.map((i) => i.name)));
-		try {
-			pi.setSessionName(fresh); // surface the handle in the terminal title
-		} catch {
-			/* best-effort; the registry entry is what matters */
-		}
-		return fresh;
+		const prior = known.find(i => activeSessionId && i.session_id === activeSessionId);
+		const sessionName = pi.getSessionName()?.trim();
+		const reserved = new Set(known.map(i => i.name));
+		// Existing registry entry wins, even if Pi's title changes. An
+		// explicitly named worker can use its --name as the initial handle.
+		return activeHandle = prior?.name ??
+			(sessionName && sessionName === herdrSafeName(sessionName) && !reserved.has(sessionName) ? sessionName : generateName(reserved));
+	}
+
+	function displayTitle(): string | undefined {
+		const title = cleanTitle(pi.getSessionName());
+		return title !== ownName() ? title : undefined;
 	}
 
 	/**
@@ -1492,7 +1503,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 	 * unique one. Retries while the agent is still being detected. Returns the
 	 * effective name, or undefined if we could never set one.
 	 */
-	async function assertHerdrName(handle: string): Promise<string | undefined> {
+	async function assertHerdrName(handle: string, sessionId: string | undefined): Promise<string | undefined> {
 		if (!selfPane) return undefined;
 		const base = herdrSafeName(handle) ?? herdrSafeName(generateName()) ?? "pi";
 		let suffix = 0;
@@ -1503,7 +1514,8 @@ export default function herdrExtension(pi: ExtensionAPI) {
 				const rec = asRecord(result);
 				const agent = asRecord(rec?.agent) ?? rec;
 				const existing = typeof agent?.name === "string" && agent.name ? agent.name : undefined;
-				if (existing) return existing;
+				if (activeSessionId !== sessionId) return undefined;
+				if (existing && (existing !== previousHandle || existing === handle)) return existing;
 				const candidate = suffix === 0 ? base : `${base.slice(0, 29)}-${suffix + 1}`;
 				await callHerdr({
 					args: buildHerdrArgs({ action: "agent_rename", target: selfPane, name: candidate }),
@@ -1534,12 +1546,13 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		if (!selfPane) return;
 		const name = resolvedName ?? ownName();
 		const dir = projectName(ctx.cwd);
-		const self = identityForPane(selfPane);
+		const self = readIdentities().find(id => id.session_id === ctx.sessionManager.getSessionId());
 		const args = panelMetadataArgs(selfPane, name, {
 			group: self?.group,
 			stage: self?.stage,
 			project: dir,
 			task: self?.task_label,
+			title: displayTitle(),
 			parent: self?.parent_name,
 		});
 		const key = args.join(" ");
@@ -1572,6 +1585,7 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		const owned = {
 			pane_id: selfPane,
 			name: resolvedName ?? ownName(),
+			title: displayTitle(),
 			session_path: sessionPath,
 			session_id: sessionId,
 			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
@@ -1618,9 +1632,12 @@ export default function herdrExtension(pi: ExtensionAPI) {
 
 	/** Reconcile herdr's panel name in the background (never blocks startup). */
 	async function reconcileName(ctx: ExtensionContext): Promise<void> {
-		const name = await assertHerdrName(ownName());
+		const id = ctx.sessionManager.getSessionId();
+		const name = await assertHerdrName(ownName(), id);
+		if (activeSessionId !== id) return;
 		if (name) {
 			herdrNamed = true;
+			activeHandle = name;
 			registerSelf(ctx, name);
 			if (ircNode) ircNode.identity = name;
 		}
@@ -1633,7 +1650,19 @@ export default function herdrExtension(pi: ExtensionAPI) {
 	let currentCtx: ExtensionContext | undefined;
 
 	pi.on("session_start", (_event, ctx) => {
-		if (currentCtx && currentCtx.sessionManager.getSessionId() !== ctx.sessionManager.getSessionId()) spawned.clear();
+		const id = ctx.sessionManager.getSessionId();
+		if (activeSessionId !== id) {
+			if (activeSessionId && selfPane) {
+				previousHandle = activeHandle;
+				try { mergeIdentity(activeSessionId, { pid: 0 }); } catch { /* best effort */ }
+			}
+			activeSessionId = id;
+			const recorded = readIdentities().find(item => item.session_id === id);
+			legacyUntitled = recorded && !recorded.title && pi.getSessionName() === recorded.name ? recorded.name : undefined;
+			activeHandle = undefined;
+			lastPanelMetaKey = undefined;
+			spawned.clear();
+		}
 		sessionModels = modelsFromCtx(ctx);
 		currentCtx = ctx;
 		delegates.sync(ctx.sessionManager.getBranch() as unknown as readonly DelegateEntryLike[]);
@@ -1659,6 +1688,24 @@ export default function herdrExtension(pi: ExtensionAPI) {
 	pi.on("agent_start", (_event, ctx) => {
 		if (!herdrNamed) void reconcileName(ctx);
 		else void reportPanel(ctx); // refresh if the cwd/project changed
+	});
+
+	registerSessionTitles(pi, {
+		canAutoTitle(ctx) {
+			const currentName = pi.getSessionName();
+			if (currentName && (currentName !== legacyUntitled || displayTitle())) return false;
+			const identity = readIdentities().find(item => item.session_id === ctx.sessionManager.getSessionId());
+			// Delegates already have a task label; don't buy 50 title requests in a fan-out.
+			if (identity?.task_label || identity?.parent_session_id) return false;
+			return !ctx.sessionManager.getBranch().some(entry => entry.type === "message" && entry.message.role === "user" &&
+				(typeof entry.message.content === "string" ? entry.message.content.startsWith("<!-- herdr:assignment ") :
+					entry.message.content.some(block => block.type === "text" && block.text.startsWith("<!-- herdr:assignment "))));
+		},
+	});
+	pi.on("session_info_changed", (_event, ctx) => {
+		legacyUntitled = undefined;
+		registerSelf(ctx);
+		void reportPanel(ctx);
 	});
 
 	// Keep the roster's model/thinking metadata fresh.
@@ -1776,6 +1823,9 @@ export default function herdrExtension(pi: ExtensionAPI) {
 		const node = new IrcNode({
 			paneId,
 			identity: paneId,
+			getTitle: () => displayTitle() ?? (activeSessionId
+				? readIdentities().find(id => id.session_id === activeSessionId)?.task_label
+				: undefined),
 			deliver: (env) => {
 				// Steer stays inside the current turn (no triggerTurn); everything
 				// else queues as a follow-up and wakes the agent. Pairing

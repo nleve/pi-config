@@ -23,7 +23,9 @@ import path from "node:path";
 
 export interface AgentIdentity {
 	pane_id: string;
+	/** Stable IRC/routing handle, independent of the Pi session title. */
 	name: string;
+	title?: string;
 	/** Durable identity: the pi session transcript path. */
 	session_path?: string;
 	session_id?: string;
