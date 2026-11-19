@@ -12,5 +12,6 @@
   },
   "enableInstallTelemetry": false,
   "fullscreenScrollbar": "auto",
-  "theme": "system"
+  "theme": "system",
+  "editorPaddingX": 1
 }
